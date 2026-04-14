@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 tesollo_quest3.py - Meta Quest 3 Hand Tracking → Tesollo DG-5F-M Teleoperation
-MediaPipe 완전 제거, Quest 3 OpenXR 데이터 직접 사용
+MediaPipe 완전 제거, Quest 3 OpenXR 데이터 직접 사용 + 실시간 GUI 시각화
 """
 
 import os, time, math, socket, struct, threading, sys
 import numpy as np
+import tkinter as tk
+from tkinter import ttk
 
 if os.name == "nt":
     import msvcrt
@@ -14,8 +16,6 @@ else:
     import termios
     import tty
 
-
-#python MetaQ_TesolloR_teleop.py
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -90,9 +90,8 @@ MOTOR_ENABLED = {m: True for m in range(1, 21)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 모터 제어 유틸리티 함수들 (기존 tesollo_dev.py 완전 이식)
+# 손 추적 계산 함수들
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 def _angle_deg(v1, v2):
     dot = float(np.dot(v1, v2))
@@ -121,13 +120,8 @@ def _nonthumb_joint_curls(lms, finger_idx):
     mcp, pip, dip, tip = [lms[i] for i in idx]
     wrist = lms[0]
 
-    # MCP flex/ext: wrist-mcp-pip 각도로 근사
     ang_mcp = _angle_deg(wrist - mcp, pip - mcp)
-
-    # PIP: mcp-pip-dip
     ang_pip = _angle_deg(mcp - pip, dip - pip)
-
-    # DIP: pip-dip-tip
     ang_dip = _angle_deg(pip - dip, tip - dip)
 
     curl_mcp = _curl_from_joint_angle(ang_mcp, open_deg=165.0, closed_deg=70.0)
@@ -137,173 +131,7 @@ def _nonthumb_joint_curls(lms, finger_idx):
     return curl_mcp, curl_pip, curl_dip
 
 
-
-def make_zero_duty():
-    return {m: 0 for m in range(1, 21)}
-
-
-def disabled_motor_text():
-    disabled = [m for m in range(1, 21) if not MOTOR_ENABLED[m]]
-    return ",".join(str(m) for m in disabled) if disabled else "None"
-
-
-def toggle_motor_enable(motor_id, cur_pos, prev_target, prev_duty):
-    if not (1 <= motor_id <= 20):
-        return f"Invalid motor id: {motor_id}"
-
-    MOTOR_ENABLED[motor_id] = not MOTOR_ENABLED[motor_id]
-
-    hold = int(cur_pos.get(motor_id, prev_target.get(motor_id, 0)))
-    prev_target[motor_id] = hold
-    prev_duty[motor_id] = 0
-
-    status = "OFF" if not MOTOR_ENABLED[motor_id] else "ON"
-    role = MOTOR_CONFIG[motor_id][2]
-    return f"Motor {motor_id:02d} ({role}) -> {status}"
-
-def toggle_all_motors(cur_pos, prev_target, prev_duty):
-    all_enabled = all(MOTOR_ENABLED[m] for m in range(1, 21))
-    new_state = not all_enabled
-
-    for m in range(1, 21):
-        MOTOR_ENABLED[m] = new_state
-        hold = int(cur_pos.get(m, prev_target.get(m, 0)))
-        prev_target[m] = hold
-        prev_duty[m] = 0
-
-    return f"All motors -> {'ON' if new_state else 'OFF'}"
-
-def toggle_finger_motors(finger_num, cur_pos, prev_target, prev_duty):
-    if not (1 <= finger_num <= 5):
-        return f"Invalid finger number: {finger_num}"
-    finger_key = f"finger{finger_num}"
-    motor_ids = JOINT_MAP[finger_key]
-    finger_names = {1: "Thumb", 2: "Index", 3: "Middle", 4: "Ring", 5: "Pinky"}
-    all_enabled = all(MOTOR_ENABLED[m] for m in motor_ids)
-    new_state = not all_enabled
-    for m in motor_ids:
-        MOTOR_ENABLED[m] = new_state
-        if not new_state:
-            hold = int(cur_pos.get(m, 0))
-            prev_target[m] = hold
-            prev_duty[m] = 0
-    finger_name = finger_names[finger_num]
-    motor_list = ",".join(str(m) for m in motor_ids)
-    return f"{finger_name} (M{motor_list}) -> {'ON' if new_state else 'OFF'}"
-
-
-def enforce_motor_enable_mask(cur_pos, **kwargs):
-    for m in range(1, 21):
-        if MOTOR_ENABLED[m]:
-            continue
-        hold = int(cur_pos.get(m, 0))
-        for key, data_dict in kwargs.items():
-            if data_dict is not None:
-                if key in ['desired', 'target']:
-                    data_dict[m] = hold
-                else:
-                    data_dict[m] = 0
-
-
-def clamp_target_0p1deg(motor_id, target_0p1deg):
-    limits = {
-        1:  (-150, 290),
-        2:  (-850, 900),
-        3:  (-1500, 290),
-        4:  (-900, 900),
-        5:  (-200, 310),
-        6:  (0, 1150),
-        17: (-300, 0),
-        18: (-900, 150),
-    }
-    if motor_id in limits:
-        lo, hi = limits[motor_id]
-        return int(np.clip(int(target_0p1deg), lo, hi))
-    return int(np.clip(int(target_0p1deg), -900, 1150))
-
-
-def clamp_step_to_current(motor_id, desired, current):
-    """목표값을 현재값 기준 최대 변화량으로 제한 (급격한 움직임 방지)"""
-    max_step = 100 if motor_id in [1, 5, 9, 13, 17] else 250
-    if motor_id == 2:
-        max_step = 130
-    elif motor_id == 3:
-        max_step = 150
-    elif motor_id == 4:
-        max_step = 200
-    return int(np.clip(int(desired), int(current) - max_step, int(current) + max_step))
-
-
-def rate_limit_target(motor_id, desired, prev):
-    max_speed = 80.0 if motor_id in [1, 5, 9, 13, 17] else 100.0
-    if motor_id == 2:
-        max_speed = 65.0
-    elif motor_id == 3:
-        max_speed = 70.0
-    elif motor_id == 4:
-        max_speed = 90.0
-    max_delta = max(1, int(max_speed * 10.0 * DT))
-    delta = int(desired) - int(prev)
-    return int(prev) + int(np.clip(delta, -max_delta, max_delta))
-
-
-def slew_limit_duty(motor_id, new_duty, prev_duty):
-    prev    = int(prev_duty.get(motor_id, 0))
-    limited = int(np.clip(int(new_duty), prev - MAX_DUTY_STEP, prev + MAX_DUTY_STEP))
-    prev_duty[motor_id] = limited
-    return limited
-
-
-def apply_global_limits(raw_duty_dict):
-    duty = dict(raw_duty_dict)
-
-    # 최소 duty 미만은 0으로
-    for m in list(duty.keys()):
-        if abs(duty[m]) < MIN_DUTY_TO_MOVE:
-            duty[m] = 0
-
-    # 최대 활성 관절 수 제한
-    active = [(m, abs(v)) for m, v in duty.items() if v != 0]
-    if len(active) > MAX_ACTIVE_JOINTS:
-        active.sort(key=lambda x: x[1], reverse=True)
-        keep = set(m for m in PROTECTED_JOINTS if duty.get(m, 0) != 0)
-        for m, _ in active:
-            if len(keep) >= MAX_ACTIVE_JOINTS:
-                break
-            keep.add(m)
-        for m in list(duty.keys()):
-            if m not in keep:
-                duty[m] = 0
-
-    # 총 duty 예산 제한
-    total = sum(abs(v) for v in duty.values())
-    if total > TOTAL_DUTY_BUDGET and total > 0:
-        scale = TOTAL_DUTY_BUDGET / total
-        duty  = {m: int(v * scale) for m, v in duty.items()}
-
-    return duty
-
-
-def to_duty(err_0p1deg, motor_id):
-    if abs(err_0p1deg) < DEADBAND_0P1DEG:
-        return 0
-    kp, lim, _ = MOTOR_CONFIG[motor_id]
-    d = int(kp * err_0p1deg)
-    d = int(np.clip(d, -lim, lim))
-    return DUTY_SIGN[motor_id] * d
-
-
-def curl_to_flex_deg(curl_now, flex_deg):
-    return float(np.clip(curl_now, 0.0, 1.0)) * flex_deg
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 손 추적 계산 함수들
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 def _thumb_joint_curls(lms):
-    """엄지 MCP(Motor3), IP(Motor4) curl 계산"""
     p1, p2, p3, p4 = lms[1], lms[2], lms[3], lms[4]
 
     ang_mcp  = _angle_deg(p1 - p2, p3 - p2)
@@ -316,13 +144,12 @@ def _thumb_joint_curls(lms):
 
 
 def compute_thumb_cmc_position(lms_np):
-    """Motor2 전용 하이브리드 포지션 제어"""
     thumb_tip  = lms_np[4]
     wrist      = lms_np[0]
     index_mcp  = lms_np[5]
 
-    thumb_distance     = np.linalg.norm(thumb_tip - wrist)
-    hand_size          = np.linalg.norm(index_mcp - wrist)
+    thumb_distance = np.linalg.norm(thumb_tip - wrist)
+    hand_size      = np.linalg.norm(index_mcp - wrist)
     if hand_size < 1e-6:
         hand_size = 1.0
 
@@ -371,18 +198,154 @@ def compute_splay_deg(lms_np):
         "finger1": signed_angle_2d(base, dirs["finger1"]),
     }
 
+
 def compute_pinky_cmc_position(lms_np, splay_deg_dict):
-    # pinky CMC는 새끼손가락의 기저부 벌어짐/접힘 성분을 proxy로 근사
-    # 우선 pinky splay의 절대값 일부를 CMC 성분으로 사용
     pinky_splay = splay_deg_dict["finger5"]
-
-    # CMC는 MCP ab/ad보다 더 기저부 동작이므로 과도하지 않게 축소
     cmc_proxy_deg = np.clip(0.6 * pinky_splay, -20.0, 20.0)
-
-    # 0~1로 정규화
     ratio = (cmc_proxy_deg + 20.0) / 40.0
     return float(np.clip(ratio, 0.0, 1.0))
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 모터 제어 유틸리티 함수들
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def make_zero_duty():
+    return {m: 0 for m in range(1, 21)}
+
+
+def disabled_motor_text():
+    disabled = [m for m in range(1, 21) if not MOTOR_ENABLED[m]]
+    return ",".join(str(m) for m in disabled) if disabled else "None"
+
+
+def toggle_motor_enable(motor_id, cur_pos, prev_target, prev_duty):
+    if not (1 <= motor_id <= 20):
+        return f"Invalid motor id: {motor_id}"
+
+    MOTOR_ENABLED[motor_id] = not MOTOR_ENABLED[motor_id]
+
+    hold = int(cur_pos.get(motor_id, prev_target.get(motor_id, 0)))
+    prev_target[motor_id] = hold
+    prev_duty[motor_id] = 0
+
+    status = "OFF" if not MOTOR_ENABLED[motor_id] else "ON"
+    role = MOTOR_CONFIG[motor_id][2]
+    return f"Motor {motor_id:02d} ({role}) -> {status}"
+
+
+def toggle_all_motors(cur_pos, prev_target, prev_duty):
+    all_enabled = all(MOTOR_ENABLED[m] for m in range(1, 21))
+    new_state = not all_enabled
+
+    for m in range(1, 21):
+        MOTOR_ENABLED[m] = new_state
+        hold = int(cur_pos.get(m, prev_target.get(m, 0)))
+        prev_target[m] = hold
+        prev_duty[m] = 0
+
+    return f"All motors -> {'ON' if new_state else 'OFF'}"
+
+
+def enforce_motor_enable_mask(cur_pos, **kwargs):
+    for m in range(1, 21):
+        if MOTOR_ENABLED[m]:
+            continue
+        hold = int(cur_pos.get(m, 0))
+        for key, data_dict in kwargs.items():
+            if data_dict is not None:
+                if key in ['desired', 'target']:
+                    data_dict[m] = hold
+                else:
+                    data_dict[m] = 0
+
+
+def clamp_target_0p1deg(motor_id, target_0p1deg):
+    limits = {
+        1:  (-150, 290),
+        2:  (-850, 900),
+        3:  (-1500, 290),
+        4:  (-900, 900),
+        5:  (-200, 310),
+        6:  (0, 1150),
+        17: (-300, 0),
+        18: (-900, 150),
+    }
+    if motor_id in limits:
+        lo, hi = limits[motor_id]
+        return int(np.clip(int(target_0p1deg), lo, hi))
+    return int(np.clip(int(target_0p1deg), -900, 1150))
+
+
+def clamp_step_to_current(motor_id, desired, current):
+    max_step = 100 if motor_id in [1, 5, 9, 13, 17] else 250
+    if motor_id == 2:
+        max_step = 130
+    elif motor_id == 3:
+        max_step = 150
+    elif motor_id == 4:
+        max_step = 200
+    return int(np.clip(int(desired), int(current) - max_step, int(current) + max_step))
+
+
+def rate_limit_target(motor_id, desired, prev):
+    max_speed = 80.0 if motor_id in [1, 5, 9, 13, 17] else 100.0
+    if motor_id == 2:
+        max_speed = 65.0
+    elif motor_id == 3:
+        max_speed = 70.0
+    elif motor_id == 4:
+        max_speed = 90.0
+    max_delta = max(1, int(max_speed * 10.0 * DT))
+    delta = int(desired) - int(prev)
+    return int(prev) + int(np.clip(delta, -max_delta, max_delta))
+
+
+def slew_limit_duty(motor_id, new_duty, prev_duty):
+    prev    = int(prev_duty.get(motor_id, 0))
+    limited = int(np.clip(int(new_duty), prev - MAX_DUTY_STEP, prev + MAX_DUTY_STEP))
+    prev_duty[motor_id] = limited
+    return limited
+
+
+def apply_global_limits(raw_duty_dict):
+    duty = dict(raw_duty_dict)
+
+    for m in list(duty.keys()):
+        if abs(duty[m]) < MIN_DUTY_TO_MOVE:
+            duty[m] = 0
+
+    active = [(m, abs(v)) for m, v in duty.items() if v != 0]
+    if len(active) > MAX_ACTIVE_JOINTS:
+        active.sort(key=lambda x: x[1], reverse=True)
+        keep = set(m for m in PROTECTED_JOINTS if duty.get(m, 0) != 0)
+        for m, _ in active:
+            if len(keep) >= MAX_ACTIVE_JOINTS:
+                break
+            keep.add(m)
+        for m in list(duty.keys()):
+            if m not in keep:
+                duty[m] = 0
+
+    total = sum(abs(v) for v in duty.values())
+    if total > TOTAL_DUTY_BUDGET and total > 0:
+        scale = TOTAL_DUTY_BUDGET / total
+        duty  = {m: int(v * scale) for m, v in duty.items()}
+
+    return duty
+
+
+def to_duty(err_0p1deg, motor_id):
+    if abs(err_0p1deg) < DEADBAND_0P1DEG:
+        return 0
+    kp, lim, _ = MOTOR_CONFIG[motor_id]
+    d = int(kp * err_0p1deg)
+    d = int(np.clip(d, -lim, lim))
+    return DUTY_SIGN[motor_id] * d
+
+
+def curl_to_flex_deg(curl_now, flex_deg):
+    return float(np.clip(curl_now, 0.0, 1.0)) * flex_deg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -448,7 +411,6 @@ class Quest3HandReceiver:
             data_part = line[10:]
             values    = list(map(float, data_part.split(',')))
 
-            # 21개 관절 × 3좌표(63) + pinch(1) = 64개
             if len(values) >= 64:
                 landmarks = []
                 for i in range(21):
@@ -477,7 +439,227 @@ class Quest3HandReceiver:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DG5FDevClient (기존 tesollo_dev.py 완전 이식)
+# 실시간 GUI 시각화 클래스
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class HandJointVisualizer:
+    """별도 스레드에서 실행되는 관절 각도 시각화 GUI"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = True
+        self.data = {
+            "thumb": {"cmc": 0.0, "mcp": 0.0, "ip": 0.0},
+            "fingers": {
+                "finger2": [0.0, 0.0, 0.0],
+                "finger3": [0.0, 0.0, 0.0],
+                "finger4": [0.0, 0.0, 0.0],
+                "finger5": [0.0, 0.0, 0.0],
+            },
+            "splay": {f: 0.0 for f in FINGER_ORDER},
+            "pinch": 0.0,
+            "status": "대기중",
+            "active": 0,
+            "duty": 0,
+        }
+
+        self.thread = threading.Thread(target=self._run_gui, daemon=True)
+        self.thread.start()
+
+    def update_data(self, **kwargs):
+        """메인 루프에서 호출하여 데이터 업데이트"""
+        with self.lock:
+            self.data.update(kwargs)
+
+    def _run_gui(self):
+        """GUI 메인 루프 (별도 스레드)"""
+        self.root = tk.Tk()
+        self.root.title("Hand Joint Angles - Quest 3 → Tesollo")
+        self.root.geometry("620x580")
+        self.root.configure(bg="#2b2b2b")
+
+        self._create_widgets()
+        self._schedule_update()
+
+        try:
+            self.root.mainloop()
+        except:
+            pass
+
+    def _create_widgets(self):
+        """GUI 위젯 생성"""
+        # 상단 상태 표시
+        status_frame = tk.Frame(self.root, bg="#313244", pady=8)
+        status_frame.pack(fill="x", padx=5, pady=5)
+
+        self.status_label = tk.Label(status_frame, text="● 대기중",
+                                   fg="#ff6b6b", bg="#313244", 
+                                   font=("Consolas", 12, "bold"))
+        self.status_label.pack(side="left", padx=15)
+
+        self.pinch_label = tk.Label(status_frame, text="Pinch: 0.00",
+                                  fg="#4ecdc4", bg="#313244", 
+                                  font=("Consolas", 12))
+        self.pinch_label.pack(side="left", padx=15)
+
+        self.active_label = tk.Label(status_frame, text="Active: 0  Duty: 0",
+                                   fg="#fab387", bg="#313244", 
+                                   font=("Consolas", 12))
+        self.active_label.pack(side="right", padx=15)
+
+        # 구분선
+        tk.Frame(self.root, bg="#555", height=2).pack(fill="x", pady=5)
+
+        # 스크롤 가능한 메인 영역
+        canvas = tk.Canvas(self.root, bg="#2b2b2b", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="#2b2b2b")
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+        canvas.pack(side="left", fill="both", expand=True, padx=(10,0))
+        scrollbar.pack(side="right", fill="y", padx=(0,10))
+
+        # 손가락별 위젯 생성
+        self.progress_bars = {}
+        self.value_labels = {}
+
+        finger_names = {"finger1": "Thumb", "finger2": "Index", "finger3": "Middle", 
+                       "finger4": "Ring", "finger5": "Pinky"}
+        colors = {"finger1": "#ff6b6b", "finger2": "#4ecdc4", "finger3": "#45b7d1",
+                 "finger4": "#96ceb4", "finger5": "#ffeaa7"}
+
+        for i, (finger_key, finger_name) in enumerate(finger_names.items()):
+            color = colors[finger_key]
+
+            # 손가락 제목
+            title_frame = tk.Frame(scrollable_frame, bg="#2b2b2b")
+            title_frame.pack(fill="x", pady=(10 if i > 0 else 0, 5))
+
+            tk.Label(title_frame, text=f"▶ {finger_name}", fg=color, bg="#2b2b2b",
+                    font=("Consolas", 11, "bold")).pack(side="left")
+
+            # Splay 표시
+            splay_frame = tk.Frame(scrollable_frame, bg="#2b2b2b")
+            splay_frame.pack(fill="x", padx=20, pady=2)
+
+            tk.Label(splay_frame, text="Splay:", fg="#999", bg="#2b2b2b",
+                    font=("Consolas", 9), width=8, anchor="w").pack(side="left")
+
+            splay_bar = ttk.Progressbar(splay_frame, length=220, mode='determinate')
+            splay_bar.pack(side="left", padx=5)
+
+            splay_label = tk.Label(splay_frame, text="0.0°", fg="#ccc", bg="#2b2b2b",
+                                 font=("Consolas", 9), width=8)
+            splay_label.pack(side="left", padx=5)
+
+            self.progress_bars[(finger_key, "splay")] = splay_bar
+            self.value_labels[(finger_key, "splay")] = splay_label
+
+            # 관절별 막대
+            if finger_key == "finger1":
+                joints = [("cmc", "CMC"), ("mcp", "MCP"), ("ip", "IP")]
+            else:
+                joints = [("mcp", "MCP"), ("pip", "PIP"), ("dip", "DIP")]
+
+            for joint_key, joint_name in joints:
+                joint_frame = tk.Frame(scrollable_frame, bg="#2b2b2b")
+                joint_frame.pack(fill="x", padx=30, pady=1)
+
+                tk.Label(joint_frame, text=f"{joint_name}:", fg="#999", bg="#2b2b2b",
+                        font=("Consolas", 9), width=6, anchor="w").pack(side="left")
+
+                progress_bar = ttk.Progressbar(joint_frame, length=220, mode='determinate')
+                progress_bar.pack(side="left", padx=5)
+
+                value_label = tk.Label(joint_frame, text="0.00", fg="#ccc", bg="#2b2b2b",
+                                     font=("Consolas", 9), width=6)
+                value_label.pack(side="left", padx=5)
+
+                self.progress_bars[(finger_key, joint_key)] = progress_bar
+                self.value_labels[(finger_key, joint_key)] = value_label
+
+    def _schedule_update(self):
+        """30Hz로 GUI 업데이트"""
+        if not self.running:
+            return
+
+        try:
+            self._update_display()
+        except:
+            pass
+
+        self.root.after(33, self._schedule_update)  # ~30Hz
+
+    def _update_display(self):
+        """화면 업데이트"""
+        with self.lock:
+            data_copy = dict(self.data)
+
+        # 상태 업데이트
+        pinch = data_copy.get("pinch", 0.0)
+        status = data_copy.get("status", "대기중")
+        active = data_copy.get("active", 0)
+        duty = data_copy.get("duty", 0)
+
+        if pinch > 0.5:
+            self.status_label.config(text="● PINCH", fg="#a6e3a1")
+        elif status == "추적중":
+            self.status_label.config(text="● 추적중", fg="#4ecdc4")
+        else:
+            self.status_label.config(text="● 대기중", fg="#ff6b6b")
+
+        self.pinch_label.config(text=f"Pinch: {pinch:.2f}")
+        self.active_label.config(text=f"Active: {active}  Duty: {duty}")
+
+        # 엄지 업데이트
+        thumb_data = data_copy.get("thumb", {})
+        for joint in ["cmc", "mcp", "ip"]:
+            value = thumb_data.get(joint, 0.0)
+            key = ("finger1", joint)
+            if key in self.progress_bars:
+                self.progress_bars[key]['value'] = value * 100
+                self.value_labels[key].config(text=f"{value:.2f}")
+
+        # 다른 손가락 업데이트
+        fingers_data = data_copy.get("fingers", {})
+        for finger_key in ["finger2", "finger3", "finger4", "finger5"]:
+            joint_values = fingers_data.get(finger_key, [0.0, 0.0, 0.0])
+            joint_names = ["mcp", "pip", "dip"]
+
+            for i, joint_name in enumerate(joint_names):
+                if i < len(joint_values):
+                    value = joint_values[i]
+                    key = (finger_key, joint_name)
+                    if key in self.progress_bars:
+                        self.progress_bars[key]['value'] = value * 100
+                        self.value_labels[key].config(text=f"{value:.2f}")
+
+        # Splay 업데이트
+        splay_data = data_copy.get("splay", {})
+        for finger_key in FINGER_ORDER:
+            splay_value = splay_data.get(finger_key, 0.0)
+            key = (finger_key, "splay")
+            if key in self.progress_bars:
+                # -30~30도를 0~100으로 매핑
+                normalized = (splay_value + 30.0) / 60.0 * 100
+                self.progress_bars[key]['value'] = max(0, min(100, normalized))
+                self.value_labels[key].config(text=f"{splay_value:+.1f}°")
+
+    def stop(self):
+        """GUI 종료"""
+        self.running = False
+        if hasattr(self, 'root'):
+            try:
+                self.root.quit()
+            except:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DG5FDevClient (Tesollo 통신)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DG5FDevClient:
@@ -547,7 +729,7 @@ class DG5FDevClient:
 
 def main():
     print("═" * 60)
-    print("Quest 3 → Tesollo DG-5F-M Teleoperation")
+    print("Quest 3 → Tesollo DG-5F-M Teleoperation (실시간 GUI 포함)")
     print(f"TCP 포트  : {QUEST_TCP_PORT}  (adb reverse tcp:{QUEST_TCP_PORT} tcp:{QUEST_TCP_PORT})")
     print(f"Tesollo   : {GRIPPER_IP}:{GRIPPER_PORT}")
     print("Ctrl+C 로 종료")
@@ -556,46 +738,37 @@ def main():
     # Quest 3 수신 서버 시작
     hand_receiver = Quest3HandReceiver()
 
+    # 관절 각도 시각화 GUI 시작
+    visualizer = HandJointVisualizer()
+
     # Tesollo Hand 연결
     gr = DG5FDevClient(GRIPPER_IP, GRIPPER_PORT, timeout=0.5)
     gr.connect()
 
-    # ─────────────────────────────────────────────────────────────
-    # 제어 상태 초기화 (※ keyboard_input_loop보다 먼저!)
-    # ─────────────────────────────────────────────────────────────
-
-    # 스무딩 상태(비엄지: MCP/PIP/DIP 3개)
+    # 제어 상태 초기화
     smooth_joint_curls = {
-        "finger2": [0.0, 0.0, 0.0],  # index
-        "finger3": [0.0, 0.0, 0.0],  # middle
-        "finger4": [0.0, 0.0, 0.0],  # ring
-        "finger5": [0.0, 0.0, 0.0],  # pinky
+        "finger2": [0.0, 0.0, 0.0],
+        "finger3": [0.0, 0.0, 0.0],
+        "finger4": [0.0, 0.0, 0.0],
+        "finger5": [0.0, 0.0, 0.0],
     }
-
-    # splay 스무딩(엄지 포함)
     smooth_splay = {f: 0.0 for f in FINGER_ORDER}
 
-    # 엄지 전용 스무딩
     smooth_thumb_cmc = 0.0
     smooth_thumb_mcp = 0.0
     smooth_thumb_ip  = 0.0
 
-    # 새끼 CMC proxy 스무딩(Motor17)
     smooth_pinky_cmc = 0.0
 
-    # 제어 상태
     prev_target       = {m: 0 for m in range(1, 21)}
     prev_target_valid = False
     prev_duty         = {m: 0 for m in range(1, 21)}
     last_target       = {m: 0 for m in range(1, 21)}
 
-    # cur_pos는 입력 스레드가 먼저 접근할 수 있으므로 미리 초기화
     cur_pos = {m: 0 for m in range(1, 21)}
 
-    # 스레드 간 공유 데이터 보호용 lock
     state_lock = threading.Lock()
 
-    # 리셋 유틸 (중요: 지우면 안 됨)
     def reset_duty_state():
         for m in range(1, 21):
             prev_duty[m] = 0
@@ -608,9 +781,7 @@ def main():
             last_target[m] = v
         prev_target_valid = True
 
-    # ─────────────────────────────────────────────────────────────
-    # 키보드 입력 스레드 (실시간 키 입력)
-    # ─────────────────────────────────────────────────────────────
+    # 키보드 입력 스레드
     def keyboard_input_loop():
         nonlocal cur_pos, prev_target, prev_duty
 
@@ -618,8 +789,7 @@ def main():
         print("  T  : 모든 모터 ON/OFF 토글")
         print("  Q  : 키 입력 스레드 종료")
         print("  3~9 : 즉시 해당 모터 토글")
-        print("  1,2 : 0.55초 내 다음 숫자와 조합해서 10~20 해석 가능")
-        print("       예) 1 + 7 => 17, 2 + 0 => 20\n")
+        print("  1,2 : 0.55초 내 다음 숫자와 조합해서 10~20 해석 가능 (예: 1+7=>17)\n")
 
         digit_buffer = ""
         digit_time = 0.0
@@ -642,7 +812,6 @@ def main():
             nonlocal digit_buffer, digit_time
             if digit_buffer == "":
                 return
-
             if force or (time.time() - digit_time >= digit_timeout):
                 try:
                     motor_id = int(digit_buffer)
@@ -670,7 +839,6 @@ def main():
                 old = digit_buffer
                 digit_buffer = ""
                 digit_time = 0.0
-
                 if old.isdigit():
                     old_id = int(old)
                     if 1 <= old_id <= 20:
@@ -698,13 +866,11 @@ def main():
                 flush_digit_buffer(force=True)
                 execute_all_toggle()
                 return
-
             if ch == "Q":
                 flush_digit_buffer(force=True)
                 print("\n[KEY] 실시간 키 입력 스레드 종료")
                 running = False
                 return
-
             if ch.isdigit():
                 process_digit(ch)
                 return
@@ -738,9 +904,7 @@ def main():
     key_thread = threading.Thread(target=keyboard_input_loop, daemon=True)
     key_thread.start()
 
-    # ─────────────────────────────────────────────────────────────
     # 메인 루프
-    # ─────────────────────────────────────────────────────────────
     no_hand_frames = 0
     MAX_NO_HAND_FRAMES = 10
     last_time = time.time()
@@ -768,6 +932,7 @@ def main():
                 with state_lock:
                     reset_duty_state()
                     prev_target_valid = False
+                visualizer.update_data(status="대기중")
                 continue
 
             with state_lock:
@@ -791,14 +956,13 @@ def main():
                         reset_duty_state()
 
                 status = "연결대기" if not hand_receiver.connected else "손 미감지"
+                visualizer.update_data(status=status, pinch=0.0)
                 print(f"\r[INFO] {status} ({no_hand_frames} frames)        ", end="", flush=True)
                 continue
 
             no_hand_frames = 0
 
-            # ─────────────────────────────────────────────────────────
             # 1) 손 특성 계산(원시값)
-            # ─────────────────────────────────────────────────────────
             splay = compute_splay_deg(landmarks)
 
             thumb_cmc_position = compute_thumb_cmc_position(landmarks)
@@ -813,16 +977,11 @@ def main():
 
             pinky_cmc_position = compute_pinky_cmc_position(landmarks, splay)
 
-            # ─────────────────────────────────────────────────────────
-            # 2) 스무딩(상태 유지, 루프마다 초기화 금지!)
-            # ─────────────────────────────────────────────────────────
-
-            # splay 스무딩
+            # 2) 스무딩
             for f in FINGER_ORDER:
                 smooth_splay[f] = (1.0 - SMOOTH_ALPHA) * smooth_splay[f] + SMOOTH_ALPHA * splay[f]
                 splay[f] = smooth_splay[f]
 
-            # 비엄지 MCP/PIP/DIP 스무딩
             for f in ["finger2", "finger3", "finger4", "finger5"]:
                 mcp_c, pip_c, dip_c = joint_curls[f]
                 prev = smooth_joint_curls[f]
@@ -831,17 +990,13 @@ def main():
                 prev[2] = (1.0 - SMOOTH_ALPHA) * prev[2] + SMOOTH_ALPHA * dip_c
                 joint_curls[f] = (prev[0], prev[1], prev[2])
 
-            # 엄지 스무딩
             smooth_thumb_cmc = (1.0 - SMOOTH_ALPHA) * smooth_thumb_cmc + SMOOTH_ALPHA * thumb_cmc_position
             smooth_thumb_mcp = (1.0 - SMOOTH_ALPHA) * smooth_thumb_mcp + SMOOTH_ALPHA * thumb_mcp_curl
             smooth_thumb_ip  = (1.0 - SMOOTH_ALPHA) * smooth_thumb_ip  + SMOOTH_ALPHA * thumb_ip_curl
 
-            # 새끼 CMC proxy 스무딩
             smooth_pinky_cmc = (1.0 - SMOOTH_ALPHA) * smooth_pinky_cmc + SMOOTH_ALPHA * pinky_cmc_position
 
-            # ─────────────────────────────────────────────────────────
-            # 3) Quest → Tesollo 목표각(desired) 생성 (모터 의미 기반)
-            # ─────────────────────────────────────────────────────────
+            # 3) Quest → Tesollo 목표각(desired) 생성
             with state_lock:
                 desired = {m: prev_target[m] for m in range(1, 21)}
 
@@ -859,7 +1014,7 @@ def main():
                 desired[3] = clamp_target_0p1deg(3, TARGET_SIGN[3] * int(thumb_mcp_deg  * 10))
                 desired[4] = clamp_target_0p1deg(4, TARGET_SIGN[4] * int(thumb_ip_deg   * 10))
 
-                # Index/Middle/Ring (각각 MCP ab/ad + MCP flex + PIP + DIP)
+                # Index/Middle/Ring
                 for finger_name, base_motor in [
                     ("finger2", 5),
                     ("finger3", 9),
@@ -880,7 +1035,7 @@ def main():
                     desired[base_motor + 2] = clamp_target_0p1deg(base_motor + 2, TARGET_SIGN[base_motor + 2] * int(pip_deg   * 10))
                     desired[base_motor + 3] = clamp_target_0p1deg(base_motor + 3, TARGET_SIGN[base_motor + 3] * int(dip_deg   * 10))
 
-                # Pinky (M17~M20) : M17=CMC proxy, M18=MCP ab/ad, M19=MCP flex, M20=PIP(=PIP+0.3*DIP)
+                # Pinky (M17~M20)
                 pinky_spread_deg = float(np.clip(
                     SPLAY_GAIN_DEFAULT * splay["finger5"],
                     -SPLAY_LIMIT_DEFAULT_DEG, SPLAY_LIMIT_DEFAULT_DEG
@@ -896,9 +1051,7 @@ def main():
                 desired[19] = clamp_target_0p1deg(19, TARGET_SIGN[19] * int(pinky_mcp_deg   * 10))
                 desired[20] = clamp_target_0p1deg(20, TARGET_SIGN[20] * int(pinky_pip_deg   * 10))
 
-                # ─────────────────────────────────────────────────────
-                # 4) 제어 파이프라인: desired → target → duty
-                # ─────────────────────────────────────────────────────
+                # 4) 제어 파이프라인
                 for m in range(1, 21):
                     desired[m] = clamp_step_to_current(m, desired[m], cur_pos.get(m, 0))
 
@@ -915,16 +1068,13 @@ def main():
 
                 raw = {m: to_duty(target[m] - cur_pos.get(m, 0), m) for m in range(1, 21)}
                 enforce_motor_enable_mask(cur_pos, raw=raw)
-
                 raw = apply_global_limits(raw)
                 enforce_motor_enable_mask(cur_pos, raw=raw)
 
                 duty = {m: slew_limit_duty(m, raw.get(m, 0), prev_duty) for m in range(1, 21)}
                 enforce_motor_enable_mask(cur_pos, duty=duty, prev_duty=prev_duty)
 
-            # ─────────────────────────────────────────────────────────
             # 5) Tesollo 제어 명령 전송
-            # ─────────────────────────────────────────────────────────
             try:
                 gr.set_duty(duty)
             except Exception as e:
@@ -938,20 +1088,38 @@ def main():
                     reset_duty_state()
                 continue
 
-            # ─────────────────────────────────────────────────────────
-            # 6) 상태 출력(현재 변수 기반)
-            # ─────────────────────────────────────────────────────────
+            # 6) 상태 출력 + GUI 업데이트
             active = sum(1 for v in duty.values() if v != 0)
             total  = sum(abs(v) for v in duty.values())
 
+            # GUI 업데이트
+            visualizer.update_data(
+                thumb={
+                    "cmc": float(np.clip(smooth_thumb_cmc, 0.0, 1.0)),
+                    "mcp": float(np.clip(smooth_thumb_mcp, 0.0, 1.0)),
+                    "ip":  float(np.clip(smooth_thumb_ip,  0.0, 1.0)),
+                },
+                fingers={
+                    "finger2": [float(np.clip(v, 0.0, 1.0)) for v in joint_curls["finger2"]],
+                    "finger3": [float(np.clip(v, 0.0, 1.0)) for v in joint_curls["finger3"]],
+                    "finger4": [float(np.clip(v, 0.0, 1.0)) for v in joint_curls["finger4"]],
+                    "finger5": [float(np.clip(v, 0.0, 1.0)) for v in joint_curls["finger5"]],
+                },
+                splay=dict(splay),
+                pinch=float(pinch),
+                status="추적중",
+                active=active,
+                duty=total,
+            )
+
+            # 콘솔 출력
             idx_mcp, idx_pip, idx_dip = joint_curls["finger2"]
             pnk_mcp, pnk_pip, pnk_dip = joint_curls["finger5"]
-
             print(
                 f"\r[CTRL] pinch={pinch:.2f} "
-                f"thumb(cmc/mcp/ip)={smooth_thumb_cmc:.2f}/{smooth_thumb_mcp:.2f}/{smooth_thumb_ip:.2f} | "
-                f"idx(m/p/d)={idx_mcp:.2f}/{idx_pip:.2f}/{idx_dip:.2f} | "
-                f"pnk(m/p/d)={pnk_mcp:.2f}/{pnk_pip:.2f}/{pnk_dip:.2f} | "
+                f"T(c/m/i)={smooth_thumb_cmc:.2f}/{smooth_thumb_mcp:.2f}/{smooth_thumb_ip:.2f} | "
+                f"Idx(m/p/d)={idx_mcp:.2f}/{idx_pip:.2f}/{idx_dip:.2f} | "
+                f"Pnk(m/p/d)={pnk_mcp:.2f}/{pnk_pip:.2f}/{pnk_dip:.2f} | "
                 f"active={active} duty={total}    ",
                 end="", flush=True
             )
@@ -966,8 +1134,8 @@ def main():
             pass
         gr.close()
         hand_receiver.stop()
+        visualizer.stop()
         print("[OK] 정상 종료")
-
 
 
 if __name__ == "__main__":
