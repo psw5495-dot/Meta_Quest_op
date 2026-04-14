@@ -1,594 +1,1101 @@
-#!/usr/bin/env python3
-"""
-tesollo_quest3.py - Meta Quest 3 Hand Tracking → Tesollo DG-5F-M Teleoperation
-MediaPipe 완전 제거, Quest 3 OpenXR 데이터 직접 사용
-"""
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * Licensed under the Oculus SDK License Agreement (the "License");
+ * you may not use the Oculus SDK except in compliance with the License,
+ * which is provided at the time of installation or download, or which
+ * otherwise accompanies this software in either electronic or hard copy form.
+ *
+ * You may obtain a copy of the License at
+ * https://developer.oculus.com/licenses/oculussdk/
+ *
+ * Unless required by applicable law or agreed to in writing, the Oculus SDK
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*******************************************************************************
 
-import os, time, math, socket, struct, threading
-import numpy as np
-from queue import Queue, Empty
+Filename    :   Main.cpp
+Content     :   Simple test app to test openxr hands
+Created     :   Sept 2020
+Authors     :   Federico Schliemann
+Language    :   C++
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Configuration (기존 tesollo_dev.py와 동일)
-# ═══════════════════════════════════════════════════════════════════════════════
-GRIPPER_IP = "169.254.186.72"
-GRIPPER_PORT = 502
-QUEST_TCP_PORT = 7000
+*******************************************************************************/
 
-CONTROL_HZ = 50
-DT = 1.0 / CONTROL_HZ
+#include <cstdint>
+#include <cstdio>
 
-# Motor configuration (기존과 동일)
-MOTOR_CONFIG = {
-    1: (1.3, 300, "thumb opposition"),  2: (1.2, 320, "thumb CMC flex"),
-    3: (1.0, 280, "thumb MCP flex"),    4: (0.8, 200, "thumb IP flex"),
-    5: (1.2, 250, "index spread"),     6: (0.8, 200, "index flex 1"),
-    7: (0.8, 200, "index flex 2"),     8: (0.8, 200, "index flex 3"),
-    9: (1.2, 250, "middle spread"),    10: (0.8, 200, "middle flex 1"),
-    11: (0.8, 200, "middle flex 2"),   12: (0.8, 200, "middle flex 3"),
-    13: (1.2, 250, "ring spread"),     14: (0.8, 200, "ring flex 1"),
-    15: (0.8, 200, "ring flex 2"),     16: (0.8, 200, "ring flex 3"),
-    17: (1.5, 320, "pinky spread"),    18: (1.1, 260, "pinky flex 1"),
-    19: (0.8, 200, "pinky flex 2"),    20: (0.8, 200, "pinky flex 3"),
-}
+#include "XrApp.h"
 
-# Motion parameters
-FLEX_DEG_DEFAULT = 90.0
-FLEX_DEG_THUMB_CMC = 85.0
-FLEX_DEG_THUMB_MCP = 100.0
-FLEX_DEG_THUMB_IP = 90.0
+#include "Input/SkeletonRenderer.h"
+#include "Input/ControllerRenderer.h"
+#include "Input/TinyUI.h"
+#include "Input/AxisRenderer.h"
+#include "Input/HandRenderer.h"
+#include "Render/SimpleBeamRenderer.h"
+#include "Render/GeometryRenderer.h"
 
-MOTOR2_DISTANCE_MIN = 0.08
-MOTOR2_DISTANCE_MAX = 0.28
-MOTOR2_WEIGHT_DISTANCE = 0.6
-MOTOR2_WEIGHT_ANGLE = 0.4
 
-SPLAY_GAIN_DEFAULT = 1.0
-SPLAY_LIMIT_DEFAULT_DEG = 25.0
-SPLAY_GAIN_THUMB = 2.0
-SPLAY_LIMIT_THUMB_DEG = 90.0
-SMOOTH_ALPHA = 0.35
+#include <string>
+#include <cstring>
 
-# Control limits
-DEADBAND_0P1DEG = 8
-MAX_DUTY_STEP = 40
-TOTAL_DUTY_BUDGET = 1500
-MAX_ACTIVE_JOINTS = 12
-MIN_DUTY_TO_MOVE = 18
-PROTECTED_JOINTS = {17, 18}
+#include "TcpSender.h"   // 새로 만들 파일
+#include "NetPacket.h"   // HandPacket, NetPose 정의
 
-# Mappings
-FINGER_ORDER = ["finger1", "finger2", "finger3", "finger4", "finger5"]
-JOINT_MAP = {
-    "finger1": [1, 2, 3, 4], "finger2": [5, 6, 7, 8], "finger3": [9, 10, 11, 12],
-    "finger4": [13, 14, 15, 16], "finger5": [17, 18, 19, 20]
-}
-TARGET_SIGN = {i: 1 for i in range(1, 21)}
-for m in [3, 4, 17, 18]:
-    TARGET_SIGN[m] = -1
-DUTY_SIGN = {i: 1 for i in range(1, 21)}
-MOTOR_ENABLED = {m: True for m in range(1, 21)}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Quest 3 TCP 수신 서버
-# ═══════════════════════════════════════════════════════════════════════════════
-class Quest3HandReceiver:
-    def __init__(self, port=QUEST_TCP_PORT):
-        self.port = port
-        self.latest_landmarks = None
-        self.latest_pinch = 0.0
-        self.running = True
-        self.lock = threading.Lock()
-        
-        # TCP 서버 소켓 설정
-        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_sock.bind(("0.0.0.0", port))
-        self.server_sock.listen(1)
-        self.server_sock.settimeout(1.0)
-        
-        # 백그라운드 스레드 시작
-        self.thread = threading.Thread(target=self._server_loop, daemon=True)
-        self.thread.start()
-        print(f"[TCP] Quest 3 수신 서버 시작: 포트 {port}")
+#define FORCE_ONLY_SIMPLE_CONTROLLER_PROFILE
 
-    def _server_loop(self):
-        """Quest 3 연결을 대기하고 데이터를 수신하는 메인 루프"""
-        while self.running:
-            try:
-                print("[TCP] Quest 3 연결 대기 중...")
-                conn, addr = self.server_sock.accept()
-                print(f"[TCP] Quest 3 연결됨: {addr}")
-                self._handle_client(conn)
-                print("[TCP] Quest 3 연결 종료")
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"[TCP] 서버 오류: {e}")
-                time.sleep(1.0)
+class XrHandsApp : public OVRFW::XrApp {
+   private:
+    static constexpr std::string_view kSampleExplanation =
+        "OpenXR Hand Tracking:                                              \n"
+        "                                                                   \n"
+        "Press the buttons under the Left and Right hand labels to:         \n"
+        "Mesh: toggle rendering the hand mesh data.                         \n"
+        "Joints: toggle rendering the hand joints as spheres.               \n"
+        "Capsules: toggle rendering the hand capsules as rounded cylinders. \n";
 
-    def _handle_client(self, conn):
-        """개별 클라이언트 연결 처리"""
-        conn.settimeout(2.0)
-        buffer = ""
-        
-        try:
-            while self.running:
-                data = conn.recv(4096).decode('utf-8', errors='ignore')
-                if not data:
-                    break
-                    
-                buffer += data
-                
-                # 줄바꿈 단위로 메시지 파싱
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    self._parse_hand_data(line.strip())
-                    
-        except Exception as e:
-            print(f"[TCP] 수신 오류: {e}")
-        finally:
-            conn.close()
 
-    def _parse_hand_data(self, line):
-        """Quest 3에서 받은 CSV 데이터를 파싱"""
-        try:
-            if not line.startswith("HAND_DATA,"):
-                return
-                
-            # "HAND_DATA," 제거
-            data_part = line[10:]
-            values = list(map(float, data_part.split(',')))
-            
-            # 21개 관절 × 3좌표 + pinch = 64개 값
-            if len(values) >= 64:
-                # 21개 관절 좌표 추출
-                landmarks = []
-                for i in range(21):
-                    x = values[i * 3]
-                    y = values[i * 3 + 1] 
-                    z = values[i * 3 + 2]
-                    landmarks.append([x, y, z])
-                
-                # pinch 값
-                pinch = values[63]
-                
-                # 스레드 안전하게 업데이트
-                with self.lock:
-                    self.latest_landmarks = np.array(landmarks, dtype=np.float32)
-                    self.latest_pinch = pinch
-                    
-        except Exception as e:
-            print(f"[TCP] 파싱 오류: {e}")
-
-    def get_latest_data(self):
-        """최신 손 데이터 반환 (landmarks, pinch)"""
-        with self.lock:
-            return self.latest_landmarks, self.latest_pinch
-
-    def stop(self):
-        """서버 중지"""
-        self.running = False
-        try:
-            self.server_sock.close()
-        except:
-            pass
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 손 추적 계산 함수들 (기존 tesollo_dev.py와 동일)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _angle_deg(v1, v2):
-    dot = float(np.dot(v1, v2))
-    n1 = float(np.linalg.norm(v1))
-    n2 = float(np.linalg.norm(v2))
-    if n1 < 1e-9 or n2 < 1e-9:
-        return 180.0
-    c = np.clip(dot / (n1 * n2), -1.0, 1.0)
-    return math.degrees(math.acos(c))
-
-def _curl_from_joint_angle(angle_deg, open_deg=170.0, closed_deg=70.0):
-    curl = (open_deg - angle_deg) / (open_deg - closed_deg)
-    return float(np.clip(curl, 0.0, 1.0))
-
-def _finger_curl(lms, finger_idx):
-    finger_landmarks = {
-        "finger1": [1, 2, 3, 4], "finger2": [5, 6, 7, 8], "finger3": [9, 10, 11, 12],
-        "finger4": [13, 14, 15, 16], "finger5": [17, 18, 19, 20]
-    }
-    idx = finger_landmarks[finger_idx]
-    pts = [lms[i] for i in idx]
-    if finger_idx == "finger1":
-        return 0.0  # 엄지는 별도 처리
-    mcp, pip, dip, tip = pts
-    ang_pip = _angle_deg(mcp - pip, dip - pip)
-    ang_dip = _angle_deg(pip - dip, tip - dip)
-    avg = 0.6 * ang_pip + 0.4 * ang_dip
-    return _curl_from_joint_angle(avg)
-
-def _thumb_joint_curls(lms):
-    """엄지의 MCP, IP 관절 curl 계산"""
-    p1, p2, p3, p4 = lms[1], lms[2], lms[3], lms[4]
-    
-    # MCP Flexion (Motor 3)
-    ang_mcp = _angle_deg(p1 - p2, p3 - p2)
-    curl_mcp = _curl_from_joint_angle(ang_mcp)
-    
-    # IP Flexion (Motor 4)
-    ang_ip = _angle_deg(p2 - p3, p4 - p3)
-    curl_ip = _curl_from_joint_angle(ang_ip)
-    
-    return curl_mcp, curl_ip
-
-def compute_thumb_cmc_position(lms_np):
-    """Motor2 전용 하이브리드 포지션 제어"""
-    # 거리 기반 계산
-    thumb_tip = lms_np[4]
-    wrist = lms_np[0]
-    index_mcp = lms_np[5]
-    
-    thumb_distance = np.linalg.norm(thumb_tip - wrist)
-    hand_size = np.linalg.norm(index_mcp - wrist)
-    if hand_size < 1e-6:
-        hand_size = 1.0
-    
-    normalized_distance = thumb_distance / hand_size
-    normalized_distance = np.clip(normalized_distance, MOTOR2_DISTANCE_MIN, MOTOR2_DISTANCE_MAX)
-    distance_ratio = (normalized_distance - MOTOR2_DISTANCE_MIN) / (MOTOR2_DISTANCE_MAX - MOTOR2_DISTANCE_MIN)
-    distance_ratio = float(np.clip(distance_ratio, 0.0, 1.0))
-    
-    # 각도 기반 계산
-    p0, p1, p2 = lms_np[0], lms_np[1], lms_np[2]
-    ang_cmc = _angle_deg(p0 - p1, p2 - p1)
-    angle_ratio = _curl_from_joint_angle(ang_cmc, open_deg=155.0, closed_deg=95.0)
-    
-    # 하이브리드 결합
-    hybrid_ratio = (MOTOR2_WEIGHT_DISTANCE * distance_ratio +
-                    MOTOR2_WEIGHT_ANGLE * angle_ratio)
-    
-    return float(np.clip(hybrid_ratio, 0.0, 1.0))
-
-def compute_splay_deg(lms_np):
-    def finger_dir_2d(mcp_idx, tip_idx):
-        v = lms_np[tip_idx] - lms_np[mcp_idx]
-        return np.array([v[0], v[1]], dtype=np.float32)
-    
-    def signed_angle_2d(a, b):
-        def unit2(v):
-            n = float(np.linalg.norm(v))
-            return v / (n + 1e-9)
-        
-        a = unit2(a)
-        b = unit2(b)
-        return math.degrees(math.atan2(a[0] * b[1] - a[1] * b[0], a[0] * b[0] + a[1] * b[1]))
-    
-    dirs = {
-        "finger2": finger_dir_2d(5, 8), "finger3": finger_dir_2d(9, 12),
-        "finger4": finger_dir_2d(13, 16), "finger5": finger_dir_2d(17, 20),
-        "finger1": finger_dir_2d(2, 4)
-    }
-    base = dirs["finger3"]
-    return {
-        "finger3": 0.0,
-        "finger2": signed_angle_2d(base, dirs["finger2"]),
-        "finger4": signed_angle_2d(base, dirs["finger4"]),
-        "finger5": signed_angle_2d(base, dirs["finger5"]),
-        "finger1": signed_angle_2d(base, dirs["finger1"]),
+    static bool IsJointPoseValid(const XrHandJointLocationEXT& j) {
+        const XrSpaceLocationFlags required =
+                XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        return (j.locationFlags & required) == required;
     }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 모터 제어 함수들 (기존 tesollo_dev.py와 동일)
-# ═══════════════════════════════════════════════════════════════════════════════
+    static void FillNetPoseFromJoint(const XrHandJointLocationEXT& joint, NetPose& outPose) {
+        std::memset(&outPose, 0, sizeof(NetPose));
 
-def make_zero_duty():
-    return {m: 0 for m in range(1, 21)}
+        if (!IsJointPoseValid(joint)) {
+            outPose.valid = 0;
+            return;
+        }
 
-def clamp_target_0p1deg(motor_id, target_0p1deg):
-    limits = {
-        1: (-150, 290), 2: (-850, 900), 3: (-1500, 290), 4: (-900, 900),
-        5: (-200, 310), 6: (0, 1150), 17: (-300, 0), 18: (-900, 150)
+        outPose.px = joint.pose.position.x;
+        outPose.py = joint.pose.position.y;
+        outPose.pz = joint.pose.position.z;
+
+        outPose.qx = joint.pose.orientation.x;
+        outPose.qy = joint.pose.orientation.y;
+        outPose.qz = joint.pose.orientation.z;
+        outPose.qw = joint.pose.orientation.w;
+
+        outPose.valid = 1;
     }
-    if motor_id in limits:
-        lo, hi = limits[motor_id]
-        return int(np.clip(int(target_0p1deg), lo, hi))
-    return int(np.clip(int(target_0p1deg), -900, 1150))
 
-def rate_limit_target(motor_id, desired, prev):
-    max_speed = 80.0 if motor_id in [1, 5, 9, 13, 17] else 100.0
-    if motor_id == 2:
-        max_speed = 65.0
-    elif motor_id == 3:
-        max_speed = 70.0
-    elif motor_id == 4:
-        max_speed = 90.0
-    max_delta = max(1, int(max_speed * 10.0 * DT))
-    delta = int(desired) - int(prev)
-    return int(prev) + np.clip(delta, -max_delta, max_delta)
 
-def slew_limit_duty(motor_id, new_duty, prev_duty):
-    prev = int(prev_duty.get(motor_id, 0))
-    limited = int(np.clip(int(new_duty), prev - MAX_DUTY_STEP, prev + MAX_DUTY_STEP))
-    prev_duty[motor_id] = limited
-    return limited
+// Main.cpp의 SendHandTelemetry 함수를 아래 코드로 완전히 교체
+#include <sstream>
 
-def apply_global_limits(raw_duty_dict):
-    duty = dict(raw_duty_dict)
-    for m in list(duty.keys()):
-        if abs(duty[m]) < MIN_DUTY_TO_MOVE:
-            duty[m] = 0
-    active = [(m, abs(v)) for m, v in duty.items() if v != 0]
-    if len(active) > MAX_ACTIVE_JOINTS:
-        active.sort(key=lambda x: x[1], reverse=True)
-        keep = set(m for m in PROTECTED_JOINTS if duty.get(m, 0) != 0)
-        for m, _ in active:
-            if len(keep) >= MAX_ACTIVE_JOINTS:
-                break
-            keep.add(m)
-        for m in list(duty.keys()):
-            if m not in keep:
-                duty[m] = 0
-    total = sum(abs(v) for v in duty.values())
-    if total > TOTAL_DUTY_BUDGET and total > 0:
-        scale = TOTAL_DUTY_BUDGET / total
-        duty = {m: int(v * scale) for m, v in duty.items()}
-    return duty
+    void SendHandTelemetry(
+            const OVRFW::ovrApplFrameIn& in,
+            const XrHandTrackingAimStateFB& aimStateL,
+            const XrHandTrackingAimStateFB& aimStateR) {
 
-def enforce_motor_enable_mask(cur_pos, **kwargs):
-    for m in range(1, 21):
-        if MOTOR_ENABLED[m]:
-            continue
-        hold = int(cur_pos.get(m, 0))
-        for key, data_dict in kwargs.items():
-            if data_dict is not None:
-                if key in ['desired', 'target']:
-                    data_dict[m] = hold
-                else:
-                    data_dict[m] = 0
+        if (!tcpReady_) {
+            tcpReady_ = tcpSender_.Init(tcpIp_.c_str(), tcpPort_);
+            if (tcpReady_) {
+                ALOG("TCP sender reconnected: %s:%d", tcpIp_.c_str(), tcpPort_);
+            }
+            return;
+        }
 
-def to_duty(err_0p1deg, motor_id):
-    if abs(err_0p1deg) < DEADBAND_0P1DEG:
-        return 0
-    kp, lim, _ = MOTOR_CONFIG[motor_id]
-    d = int(kp * err_0p1deg)
-    d = int(np.clip(d, -lim, lim))
-    return DUTY_SIGN[motor_id] * d
+        // 오른손만 전송 (Tesollo Hand 제어용)
+        if (handTrackedR_) {
+            std::ostringstream ss;
+            ss << "HAND_DATA,";
 
-def curl_to_flex_deg(curl_now, flex_deg):
-    return float(np.clip(curl_now, 0.0, 1.0)) * flex_deg
+            // MediaPipe 21개 랜드마크와 1:1 매핑되는 OpenXR 관절 순서
+            int mediapipe_mapping[21] = {
+                    XR_HAND_JOINT_WRIST_EXT,              // 0: Wrist
+                    XR_HAND_JOINT_THUMB_METACARPAL_EXT,   // 1: Thumb CMC
+                    XR_HAND_JOINT_THUMB_PROXIMAL_EXT,     // 2: Thumb MCP
+                    XR_HAND_JOINT_THUMB_DISTAL_EXT,       // 3: Thumb IP
+                    XR_HAND_JOINT_THUMB_TIP_EXT,          // 4: Thumb Tip
+                    XR_HAND_JOINT_INDEX_METACARPAL_EXT,   // 5: Index MCP base
+                    XR_HAND_JOINT_INDEX_PROXIMAL_EXT,     // 6: Index MCP
+                    XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT, // 7: Index PIP
+                    XR_HAND_JOINT_INDEX_DISTAL_EXT,       // 8: Index DIP
+                    XR_HAND_JOINT_INDEX_TIP_EXT,          // 9: Index Tip
+                    XR_HAND_JOINT_MIDDLE_METACARPAL_EXT,  // 10: Middle MCP base
+                    XR_HAND_JOINT_MIDDLE_PROXIMAL_EXT,    // 11: Middle MCP
+                    XR_HAND_JOINT_MIDDLE_INTERMEDIATE_EXT,// 12: Middle PIP
+                    XR_HAND_JOINT_MIDDLE_DISTAL_EXT,      // 13: Middle DIP
+                    XR_HAND_JOINT_MIDDLE_TIP_EXT,         // 14: Middle Tip
+                    XR_HAND_JOINT_RING_METACARPAL_EXT,    // 15: Ring MCP base
+                    XR_HAND_JOINT_RING_PROXIMAL_EXT,      // 16: Ring MCP
+                    XR_HAND_JOINT_RING_INTERMEDIATE_EXT,  // 17: Ring PIP
+                    XR_HAND_JOINT_RING_DISTAL_EXT,        // 18: Ring DIP
+                    XR_HAND_JOINT_RING_TIP_EXT,           // 19: Ring Tip
+                    XR_HAND_JOINT_LITTLE_PROXIMAL_EXT     // 20: Pinky MCP (Little metacarpal 대신)
+            };
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DG5FDevClient (기존과 동일)
-# ═══════════════════════════════════════════════════════════════════════════════
+            // 21개 관절의 x,y,z 좌표를 CSV로 직렬화
+            for (int i = 0; i < 21; i++) {
+                if (jointLocationsR_[mediapipe_mapping[i]].locationFlags &
+                    (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
 
-class DG5FDevClient:
-    def __init__(self, ip, port, timeout=0.5):
-        self.ip, self.port, self.timeout = ip, port, timeout
-        self.sock = None
+                    const XrPosef& pose = jointLocationsR_[mediapipe_mapping[i]].pose;
+                    ss << pose.position.x << "," << pose.position.y << "," << pose.position.z;
+                } else {
+                    ss << "0,0,0"; // Invalid joint는 원점으로
+                }
 
-    def connect(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect((self.ip, self.port))
-        print(f"[OK] Tesollo 연결: {self.ip}:{self.port}")
+                if (i < 20) ss << ",";
+            }
 
-    def close(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except:
-                pass
-        self.sock = None
+            // Pinch 상태 추가
+            float pinch = (aimStateR.status & XR_HAND_TRACKING_AIM_INDEX_PINCHING_BIT_FB) ? 1.0f : 0.0f;
+            ss << "," << pinch << "\n";
 
-    def _recv_exact(self, n):
-        buf = b""
-        while len(buf) < n:
-            chunk = self.sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("Socket closed")
-            buf += chunk
-        return buf
+            std::string data = ss.str();
+            bool ok = tcpSender_.Send(data.c_str(), data.length());
 
-    def transact(self, cmd, data=b""):
-        length = 2 + 1 + len(data)
-        pkt = struct.pack(">H", length) + struct.pack("B", cmd) + data
-        self.sock.sendall(pkt)
-        resp_len = struct.unpack(">H", self._recv_exact(2))[0]
-        resp_rest = self._recv_exact(resp_len - 2)
-        return resp_rest
+            if (!ok) {
+                tcpReady_ = false;
+                ALOG("TCP send failed, will reconnect");
+            }
+        }
+    }
+        if (!tcpReady_) {
+            tcpReady_ = tcpSender_.Init(tcpIp_.c_str(), tcpPort_);
+            if (tcpReady_) {
+                ALOG("TCP sender reconnected: %s:%d", tcpIp_.c_str(), tcpPort_);
+            }
+            return;
+        }
 
-    def get_positions(self):
-        resp = self.transact(0x01, data=bytes([0x01]))
-        if not resp or resp[0] != 0x01:
-            raise RuntimeError(f"Unexpected response CMD: {resp[0] if resp else None}")
-        payload = resp[1:]
-        pos = {}
-        i = 0
-        while i + 3 <= len(payload):
-            jid = payload[i]
-            val = struct.unpack(">h", payload[i + 1:i + 3])[0]
-            pos[jid] = val
-            i += 3
-        return pos
+        HandPacket pkt{};
+        std::memset(&pkt, 0, sizeof(pkt));
 
-    def set_duty(self, duty_by_id):
-        data = b""
-        for jid in range(1, 21):
-            duty = int(np.clip(int(duty_by_id.get(jid, 0)), -1000, 1000))
-            data += struct.pack("B", jid) + struct.pack(">h", duty)
-        self.sock.sendall(struct.pack(">H", 2 + 1 + len(data)) + struct.pack("B", 0x05) + data)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 메인 함수
-# ═══════════════════════════════════════════════════════════════════════════════
+        pkt.magic = kHandPacketMagic;
+        pkt.version = kHandPacketVersion;
+        pkt.reserved = 0;
 
-def main():
-    print("═" * 60)
-    print("Quest 3 → Tesollo DG-5F-M Teleoperation")
-    print(f"TCP 포트: {QUEST_TCP_PORT} (adb reverse tcp:{QUEST_TCP_PORT} tcp:{QUEST_TCP_PORT})")
-    print(f"Tesollo: {GRIPPER_IP}:{GRIPPER_PORT}")
-    print("Ctrl+C로 종료")
-    print("═" * 60)
 
-    # Quest 3 TCP 수신 서버 시작
-    hand_receiver = Quest3HandReceiver()
-    
-    # Tesollo Hand 연결
-    gr = DG5FDevClient(GRIPPER_IP, GRIPPER_PORT, timeout=0.5)
-    gr.connect()
+        // 타임스탬프 (일단 단순 변환)
+        pkt.timestampNs = static_cast<uint64_t>(in.PredictedDisplayTime * 1000000000.0);
 
-    # 제어 상태 초기화
-    smooth_curl = {f: 0.0 for f in FINGER_ORDER}
-    smooth_splay = {f: 0.0 for f in FINGER_ORDER}
-    smooth_thumb_cmc = smooth_thumb_mcp = smooth_thumb_ip = 0.0
+        pkt.leftTracked  = handTrackedL_ ? 1 : 0;
+        pkt.rightTracked = handTrackedR_ ? 1 : 0;
 
-    prev_target = {m: 0 for m in range(1, 21)}
-    prev_target_valid = False
-    prev_duty = {m: 0 for m in range(1, 21)}
-    
-    no_hand_frames = 0
-    MAX_NO_HAND_FRAMES = 10
+        // Wrist
+        FillNetPoseFromJoint(jointLocationsL_[XR_HAND_JOINT_WRIST_EXT], pkt.leftWrist);
+        FillNetPoseFromJoint(jointLocationsR_[XR_HAND_JOINT_WRIST_EXT], pkt.rightWrist);
 
-    def reset_targets_to_current(cur_pos):
-        nonlocal prev_target, prev_target_valid
-        for m in range(1, 21):
-            prev_target[m] = int(cur_pos.get(m, 0))
-        prev_target_valid = True
+        // 손끝 5개
+        FillNetPoseFromJoint(jointLocationsL_[XR_HAND_JOINT_THUMB_TIP_EXT],  pkt.leftTips[0]);
+        FillNetPoseFromJoint(jointLocationsL_[XR_HAND_JOINT_INDEX_TIP_EXT],  pkt.leftTips[1]);
+        FillNetPoseFromJoint(jointLocationsL_[XR_HAND_JOINT_MIDDLE_TIP_EXT], pkt.leftTips[2]);
+        FillNetPoseFromJoint(jointLocationsL_[XR_HAND_JOINT_RING_TIP_EXT],   pkt.leftTips[3]);
+        FillNetPoseFromJoint(jointLocationsL_[XR_HAND_JOINT_LITTLE_TIP_EXT], pkt.leftTips[4]);
 
-    def reset_duty_state():
-        for m in range(1, 21):
-            prev_duty[m] = 0
+        FillNetPoseFromJoint(jointLocationsR_[XR_HAND_JOINT_THUMB_TIP_EXT],  pkt.rightTips[0]);
+        FillNetPoseFromJoint(jointLocationsR_[XR_HAND_JOINT_INDEX_TIP_EXT],  pkt.rightTips[1]);
+        FillNetPoseFromJoint(jointLocationsR_[XR_HAND_JOINT_MIDDLE_TIP_EXT], pkt.rightTips[2]);
+        FillNetPoseFromJoint(jointLocationsR_[XR_HAND_JOINT_RING_TIP_EXT],   pkt.rightTips[3]);
+        FillNetPoseFromJoint(jointLocationsR_[XR_HAND_JOINT_LITTLE_TIP_EXT], pkt.rightTips[4]);
 
-    last_time = time.time()
+        // pinch 여부
+        pkt.leftIndexPinch =
+                (aimStateL.status & XR_HAND_TRACKING_AIM_INDEX_PINCHING_BIT_FB) ? 1.0f : 0.0f;
 
-    try:
-        while True:
-            # 주기 맞추기
-            now = time.time()
-            elapsed = now - last_time
-            if elapsed < DT:
-                time.sleep(DT - elapsed)
-            last_time = time.time()
+        pkt.rightIndexPinch =
+                (aimStateR.status & XR_HAND_TRACKING_AIM_INDEX_PINCHING_BIT_FB) ? 1.0f : 0.0f;
 
-            # Tesollo 현재 위치 읽기
-            try:
-                cur_pos = gr.get_positions()
-            except Exception as e:
-                print(f"[WARN] Tesollo 통신 오류: {e}")
-                try:
-                    gr.set_duty(make_zero_duty())
-                except:
-                    pass
-                reset_duty_state()
-                prev_target_valid = False
-                continue
+        const bool ok = tcpSender_.Send(&pkt, sizeof(pkt));
 
-            if not prev_target_valid:
-                reset_targets_to_current(cur_pos)
-                reset_duty_state()
+        ALOG(
+                "TCP send ok=%d size=%d L=%d R=%d pinchL=%.1f pinchR=%.1f",
+                ok ? 1 : 0,
+                (int)sizeof(pkt),
+                pkt.leftTracked,
+                pkt.rightTracked,
+                pkt.leftIndexPinch,
+                pkt.rightIndexPinch);
+    }
 
-            # Quest 3 손 데이터 받기
-            landmarks, pinch = hand_receiver.get_latest_data()
 
-            # 손 미감지 처리
-            if landmarks is None:
-                no_hand_frames += 1
-                if no_hand_frames >= MAX_NO_HAND_FRAMES:
-                    gr.set_duty(make_zero_duty())
-                    reset_targets_to_current(cur_pos)
-                    reset_duty_state()
-                    print(f"\r[INFO] 손 미감지 ({no_hand_frames} frames)        ", end="", flush=True)
-                continue
+public:
+    XrHandsApp() : OVRFW::XrApp() {
+        BackgroundColor = OVR::Vector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    }
 
-            no_hand_frames = 0
 
-            # 손 특성 계산 (기존 MediaPipe 로직 그대로)
-            curls = {f: _finger_curl(landmarks, f) for f in FINGER_ORDER}
-            splay = compute_splay_deg(landmarks)
-            thumb_cmc_position = compute_thumb_cmc_position(landmarks)
-            thumb_mcp_curl, thumb_ip_curl = _thumb_joint_curls(landmarks)
+    // Returns a list of OpenXr extensions needed for this app
+    virtual std::vector<const char*> GetExtensions() override {
+        std::vector<const char*> extensions = XrApp::GetExtensions();
+        extensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+        extensions.push_back(XR_FB_HAND_TRACKING_MESH_EXTENSION_NAME);
+        extensions.push_back(XR_FB_HAND_TRACKING_AIM_EXTENSION_NAME);
+        extensions.push_back(XR_FB_HAND_TRACKING_CAPSULES_EXTENSION_NAME);
+        extensions.push_back(XR_FB_PASSTHROUGH_EXTENSION_NAME);
+        return extensions;
+    }
 
-            # 스무딩
-            for f in FINGER_ORDER:
-                smooth_curl[f] = (1.0 - SMOOTH_ALPHA) * smooth_curl[f] + SMOOTH_ALPHA * curls[f]
-                smooth_splay[f] = (1.0 - SMOOTH_ALPHA) * smooth_splay[f] + SMOOTH_ALPHA * splay[f]
-                curls[f] = smooth_curl[f]
-                splay[f] = smooth_splay[f]
+#ifdef FORCE_ONLY_SIMPLE_CONTROLLER_PROFILE
+    // Returns a map from interaction profile paths to vectors of suggested bindings.
+    // xrSuggestInteractionProfileBindings() is called once for each interaction profile path in the
+    // returned map.
+    // Apps are encouraged to suggest bindings for every device/interaction profile they support.
+    // Override this for custom action bindings, or modify the default bindings.
+    std::unordered_map<XrPath, std::vector<XrActionSuggestedBinding>> GetSuggestedBindings(
+        XrInstance instance) override {
+        // Get base suggested bindings
+        std::unordered_map<XrPath, std::vector<XrActionSuggestedBinding>> allSuggestedBindings =
+            XrApp::GetSuggestedBindings(instance);
 
-            smooth_thumb_cmc = (1.0 - SMOOTH_ALPHA) * smooth_thumb_cmc + SMOOTH_ALPHA * thumb_cmc_position
-            smooth_thumb_mcp = (1.0 - SMOOTH_ALPHA) * smooth_thumb_mcp + SMOOTH_ALPHA * thumb_mcp_curl
-            smooth_thumb_ip = (1.0 - SMOOTH_ALPHA) * smooth_thumb_ip + SMOOTH_ALPHA * thumb_ip_curl
-            t_cmc, t_mcp, t_ip = smooth_thumb_cmc, smooth_thumb_mcp, smooth_thumb_ip
+        std::unordered_map<XrPath, std::vector<XrActionSuggestedBinding>>
+            onlySimpleSuggestedBindings{};
 
-            # 목표 각도 계산 (기존 로직 그대로)
-            desired = {m: prev_target[m] for m in range(1, 21)}
-            for f in FINGER_ORDER:
-                j0, j1, j2, j3 = JOINT_MAP[f]
-                if f == "finger1":
-                    # 엄지 특수 처리
-                    spread_deg = float(np.clip(SPLAY_GAIN_THUMB * splay[f], -SPLAY_LIMIT_THUMB_DEG, SPLAY_LIMIT_THUMB_DEG))
-                    cmc_deg = curl_to_flex_deg(t_cmc, FLEX_DEG_THUMB_CMC)
-                    mcp_deg = curl_to_flex_deg(t_mcp, FLEX_DEG_THUMB_MCP)
-                    ip_deg = curl_to_flex_deg(t_ip, FLEX_DEG_THUMB_IP)
-                    
-                    desired[j0] = clamp_target_0p1deg(j0, TARGET_SIGN[j0] * int(spread_deg * 10))
-                    desired[j1] = clamp_target_0p1deg(j1, TARGET_SIGN[j1] * int(cmc_deg * 10))
-                    desired[j2] = clamp_target_0p1deg(j2, TARGET_SIGN[j2] * int(mcp_deg * 10))
-                    desired[j3] = clamp_target_0p1deg(j3, TARGET_SIGN[j3] * int(ip_deg * 10))
-                else:
-                    # 다른 손가락
-                    spread_deg = float(np.clip(SPLAY_GAIN_DEFAULT * splay[f], -SPLAY_LIMIT_DEFAULT_DEG, SPLAY_LIMIT_DEFAULT_DEG))
-                    flex_deg = curl_to_flex_deg(curls[f], FLEX_DEG_DEFAULT)
-                    desired[j0] = clamp_target_0p1deg(j0, TARGET_SIGN[j0] * int(spread_deg * 10))
-                    for jx in [j1, j2, j3]:
-                        desired[jx] = clamp_target_0p1deg(jx, TARGET_SIGN[jx] * int(flex_deg * 10))
+        XrPath simpleInteractionProfile = XR_NULL_PATH;
+        OXR(xrStringToPath(
+            instance, "/interaction_profiles/khr/simple_controller", &simpleInteractionProfile));
 
-            # 제어 파이프라인 (기존과 동일)
-            for m in range(1, 21):
-                desired[m] = clamp_step_to_current(m, desired[m], cur_pos.get(m, 0))
-            enforce_motor_enable_mask(cur_pos, desired=desired, prev_target=prev_target, prev_duty=prev_duty)
+        // Only copy over suggested bindings for the simple interaction profile
+        onlySimpleSuggestedBindings[simpleInteractionProfile] =
+            allSuggestedBindings[simpleInteractionProfile];
 
-            target = {}
-            for m in range(1, 21):
-                target[m] = rate_limit_target(m, desired[m], prev_target[m])
-                prev_target[m] = target[m]
-            enforce_motor_enable_mask(cur_pos, target=target, prev_target=prev_target, prev_duty=prev_duty)
+        return onlySimpleSuggestedBindings;
+    }
+#endif
 
-            raw = {m: to_duty(target[m] - cur_pos.get(m, 0), m) for m in range(1, 21)}
-            enforce_motor_enable_mask(cur_pos, raw=raw)
-            raw = apply_global_limits(raw)
-            enforce_motor_enable_mask(cur_pos, raw=raw)
+    // Must return true if the application initializes successfully.
+    virtual bool AppInit(const xrJava* context) override {
+        if (false == ui_.Init(context, GetFileSys())) {
+            ALOG("TinyUI::Init FAILED.");
+            return false;
+        }
+        /// Build UI
+        CreateSampleDescriptionPanel();
 
-            duty = {m: slew_limit_duty(m, raw.get(m, 0), prev_duty) for m in range(1, 21)}
-            enforce_motor_enable_mask(cur_pos, duty=duty, prev_duty=prev_duty)
+        ui_.AddLabel("OpenXR Hands + FB extensions Sample", {0.1f, 1.25f, -2.0f}, {1300.0f, 100.0f})
+            ->SetSurfaceColor(0, {0.0f, 0.0f, 1.0f, 1.0f});
 
-            # Tesollo Hand 제어
-            try:
-                gr.set_duty(duty)
-            except Exception as e:
-                print(f"[WARN] 모터 제어 실패: {e}")
-                try:
-                    gr.set_duty(make_zero_duty())
-                except:
-                    pass
-                reset_targets_to_current(cur_pos)
-                reset_duty_state()
+        pinchStatusLabel_ = ui_.AddLabel(
+                "L tracked:0 pinch:0 | R tracked:0 pinch:0",
+                {0.0f, 1.0f, -1.5f},
+                {1000.0f, 100.0f});
 
-            # 상태 출력
-            active = sum(1 for v in duty.values() if v != 0)
-            total = sum(abs(v) for v in duty.values())
-            print(f"\r[CTRL] pinch={pinch:.2f} thumb_cmc={t_cmc:.2f} index={curls['finger2']:.2f} "
-                  f"middle={curls['finger3']:.2f} active={active} duty={total}     ", end="", flush=True)
+        pinchStatusLabel_->SetSurfaceColor(0, {0.1f, 0.1f, 0.1f, 0.85f});
 
-    except KeyboardInterrupt:
-        print("\n[INFO] 프로그램 종료 중...")
-    finally:
-        try:
-            gr.set_duty(make_zero_duty())
-        except:
-            pass
-        gr.close()
-        hand_receiver.stop()
-        print("[OK] 정상 종료")
+        OVRFW::VRMenuFontParms pinchFont{};
+        pinchFont.Scale = 0.6f;
+        pinchFont.AlignHoriz = OVRFW::HORIZONTAL_CENTER;
+        pinchStatusLabel_->SetFontParms(pinchFont);
 
-if __name__ == "__main__":
-    main()
+        ui_.AddLabel("Left Hand", {-1.0f, 2.5f, -2.0f}, {200.0f, 100.0f})
+            ->SetSurfaceColor(0, {0.0f, 0.0f, 1.0f, 1.0f});
+
+        renderMeshLButton_ =
+            ui_.AddButton("Mesh: On", {-1.0f, 2.25f, -2.0f}, {200.0f, 100.0f}, [this]() {
+                renderMeshL_ = !renderMeshL_;
+                if (renderMeshL_) {
+                    renderMeshLButton_->SetText("Mesh: On");
+                } else {
+                    renderMeshLButton_->SetText("Mesh: Off");
+                }
+            });
+        renderJointsLButton_ =
+            ui_.AddButton("Joints: Off", {-1.0f, 2.0f, -2.0f}, {200.0f, 100.0f}, [this]() {
+                renderJointsL_ = !renderJointsL_;
+                if (renderJointsL_) {
+                    renderJointsLButton_->SetText("Joints: On");
+                } else {
+                    renderJointsLButton_->SetText("Joints: Off");
+                }
+            });
+        renderCapsulesLButton_ =
+            ui_.AddButton("Capsules: Off", {-1.0f, 1.75f, -2.0f}, {200.0f, 100.0f}, [this]() {
+                renderCapsulesL_ = !renderCapsulesL_;
+                if (renderCapsulesL_) {
+                    renderCapsulesLButton_->SetText("Capsules: On");
+                } else {
+                    renderCapsulesLButton_->SetText("Capsules: Off");
+                }
+            });
+
+        ui_.AddLabel("Right Hand", {0.0f, 2.5f, -2.0f}, {200.0f, 100.0f})
+            ->SetSurfaceColor(0, {0.0f, 0.0f, 1.0f, 1.0f});
+
+        renderMeshRButton_ =
+            ui_.AddButton("Mesh: On", {0.0f, 2.25f, -2.0f}, {200.0f, 100.0f}, [this]() {
+                renderMeshR_ = !renderMeshR_;
+                if (renderMeshR_) {
+                    renderMeshRButton_->SetText("Mesh: On");
+                } else {
+                    renderMeshRButton_->SetText("Mesh: Off");
+                }
+            });
+        renderJointsRButton_ =
+            ui_.AddButton("Joints: Off", {0.0f, 2.0f, -2.0f}, {200.0f, 100.0f}, [this]() {
+                renderJointsR_ = !renderJointsR_;
+                if (renderJointsR_) {
+                    renderJointsRButton_->SetText("Joints: On");
+                } else {
+                    renderJointsRButton_->SetText("Joints: Off");
+                }
+            });
+        renderCapsulesRButton_ =
+            ui_.AddButton("Capsules: Off", {0.0f, 1.75f, -2.0f}, {200.0f, 100.0f}, [this]() {
+                renderCapsulesR_ = !renderCapsulesR_;
+                if (renderCapsulesR_) {
+                    renderCapsulesRButton_->SetText("Capsules: On");
+                } else {
+                    renderCapsulesRButton_->SetText("Capsules: Off");
+                }
+            });
+
+        // Inspect hand tracking system properties
+        XrSystemHandTrackingPropertiesEXT handTrackingSystemProperties{
+            XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+        XrSystemProperties systemProperties{
+            XR_TYPE_SYSTEM_PROPERTIES, &handTrackingSystemProperties};
+        OXR(xrGetSystemProperties(GetInstance(), GetSystemId(), &systemProperties));
+        if (!handTrackingSystemProperties.supportsHandTracking) {
+            // The system does not support hand tracking
+            ALOG("xrGetSystemProperties XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT FAILED.");
+            return false;
+        } else {
+            ALOG(
+                "xrGetSystemProperties XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT OK - initiallizing hand tracking...");
+        }
+
+        /// Hook up extensions for hand tracking
+        OXR(xrGetInstanceProcAddr(
+            GetInstance(),
+            "xrCreateHandTrackerEXT",
+            (PFN_xrVoidFunction*)(&xrCreateHandTrackerEXT_)));
+        OXR(xrGetInstanceProcAddr(
+            GetInstance(),
+            "xrDestroyHandTrackerEXT",
+            (PFN_xrVoidFunction*)(&xrDestroyHandTrackerEXT_)));
+        OXR(xrGetInstanceProcAddr(
+            GetInstance(),
+            "xrLocateHandJointsEXT",
+            (PFN_xrVoidFunction*)(&xrLocateHandJointsEXT_)));
+
+        // Hook up passthrough extension functions
+        OXR(xrGetInstanceProcAddr(
+                GetInstance(),
+                "xrCreatePassthroughFB",
+                (PFN_xrVoidFunction*)(&xrCreatePassthroughFB_)));
+
+        OXR(xrGetInstanceProcAddr(
+                GetInstance(),
+                "xrDestroyPassthroughFB",
+                (PFN_xrVoidFunction*)(&xrDestroyPassthroughFB_)));
+
+        OXR(xrGetInstanceProcAddr(
+                GetInstance(),
+                "xrPassthroughStartFB",
+                (PFN_xrVoidFunction*)(&xrPassthroughStartFB_)));
+
+        OXR(xrGetInstanceProcAddr(
+                GetInstance(),
+                "xrPassthroughPauseFB",
+                (PFN_xrVoidFunction*)(&xrPassthroughPauseFB_)));
+
+        OXR(xrGetInstanceProcAddr(
+                GetInstance(),
+                "xrCreatePassthroughLayerFB",
+                (PFN_xrVoidFunction*)(&xrCreatePassthroughLayerFB_)));
+
+        OXR(xrGetInstanceProcAddr(
+                GetInstance(),
+                "xrDestroyPassthroughLayerFB",
+                (PFN_xrVoidFunction*)(&xrDestroyPassthroughLayerFB_)));
+
+        OXR(xrGetInstanceProcAddr(
+                GetInstance(),
+                "xrPassthroughLayerResumeFB",
+                (PFN_xrVoidFunction*)(&xrPassthroughLayerResumeFB_)));
+
+        OXR(xrGetInstanceProcAddr(
+                GetInstance(),
+                "xrPassthroughLayerPauseFB",
+                (PFN_xrVoidFunction*)(&xrPassthroughLayerPauseFB_)));
+
+
+
+        /// Hook up extensions for hand rendering
+        OXR(xrGetInstanceProcAddr(
+                GetInstance(), "xrGetHandMeshFB", (PFN_xrVoidFunction*)(&xrGetHandMeshFB_)));
+
+        tcpReady_ = tcpSender_.Init(tcpIp_.c_str(), tcpPort_);
+        if (tcpReady_) {
+            ALOG("TCP sender initialized: %s:%d", tcpIp_.c_str(), tcpPort_);
+        } else {
+            ALOG("TCP sender init FAILED: %s:%d", tcpIp_.c_str(), tcpPort_);
+        }
+
+        return true;
+
+    }
+
+    void CreateSampleDescriptionPanel() {
+        // Panel to provide sample description to the user for context
+        auto descriptionLabel = ui_.AddLabel(
+            static_cast<std::string>(kSampleExplanation), {1.55f, 2.355f, -1.8f}, {750.0f, 400.0f});
+
+        // Align and size the description text for readability
+        OVRFW::VRMenuFontParms fontParams{};
+        fontParams.Scale = 0.5f;
+        fontParams.AlignHoriz = OVRFW::HORIZONTAL_LEFT;
+        descriptionLabel->SetFontParms(fontParams);
+        descriptionLabel->SetTextLocalPosition({-0.65f, 0, 0});
+
+        // Tilt the description billboard 45 degrees towards the user
+        descriptionLabel->SetLocalRotation(
+            OVR::Quat<float>::FromRotationVector({0, OVR::DegreeToRad(-30.0f), 0}));
+        descriptionLabel->SetSurfaceColor(0, {0.0f, 0.0f, 1.0f, 1.0f});
+    }
+
+    virtual void AppShutdown(const xrJava* context) override {
+        /// unhook extensions for hand tracking
+        xrCreateHandTrackerEXT_ = nullptr;
+        xrDestroyHandTrackerEXT_ = nullptr;
+        xrLocateHandJointsEXT_ = nullptr;
+        xrGetHandMeshFB_ = nullptr;
+
+        tcpSender_.Close();
+
+        OVRFW::XrApp::AppShutdown(context);
+        ui_.Shutdown();
+
+    }
+
+    virtual bool SessionInit() override {
+
+        /// Use LocalSpace instead of Stage Space.
+        CurrentSpace = LocalSpace;
+
+        /// Init session bound objects
+        if (false == controllerRenderL_.Init(true)) {
+            ALOG("AppInit::Init L controller renderer FAILED.");
+            return false;
+        }
+        if (false == controllerRenderR_.Init(false)) {
+            ALOG("AppInit::Init R controller renderer FAILED.");
+            return false;
+        }
+        beamRenderer_.Init(GetFileSys(), nullptr, OVR::Vector4f(1.0f), 1.0f);
+
+        /// Hand rendering
+        axisRendererL_.Init();
+        axisRendererR_.Init();
+
+        /// Hand Trackers
+        if (xrCreateHandTrackerEXT_) {
+            XrHandTrackerCreateInfoEXT createInfo{XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+            createInfo.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+            createInfo.hand = XR_HAND_LEFT_EXT;
+            OXR(xrCreateHandTrackerEXT_(GetSession(), &createInfo, &handTrackerL_));
+            createInfo.hand = XR_HAND_RIGHT_EXT;
+            OXR(xrCreateHandTrackerEXT_(GetSession(), &createInfo, &handTrackerR_));
+
+            ALOG("xrCreateHandTrackerEXT handTrackerL_=%llx", (long long)handTrackerL_);
+            ALOG("xrCreateHandTrackerEXT handTrackerR_=%llx", (long long)handTrackerR_);
+
+            /// Setup skinning meshes for both hands
+            if (xrGetHandMeshFB_) {
+                for (int handIndex = 0; handIndex < 2; ++handIndex) {
+                    /// Alias everything for initialization
+                    const bool isLeft = (handIndex == 0);
+                    auto& handTracker = isLeft ? handTrackerL_ : handTrackerR_;
+                    auto& handRenderer = isLeft ? handRendererL_ : handRendererR_;
+                    auto& handJointRenderers = isLeft ? handJointRenderersL_ : handJointRenderersR_;
+                    auto* jointLocations = isLeft ? jointLocationsL_ : jointLocationsR_;
+                    auto& handCapsuleRenderers =
+                        isLeft ? handCapsuleRenderersL_ : handCapsuleRenderersR_;
+
+                    /// two-call pattern for mesh data
+                    /// call 1 - figure out sizes
+
+                    /// mesh
+                    XrHandTrackingMeshFB mesh{XR_TYPE_HAND_TRACKING_MESH_FB};
+                    mesh.next = nullptr;
+                    /// mesh - skeleton
+                    mesh.jointCapacityInput = 0;
+                    mesh.jointCountOutput = 0;
+                    mesh.jointBindPoses = nullptr;
+                    mesh.jointRadii = nullptr;
+                    mesh.jointParents = nullptr;
+                    /// mesh - vertex
+                    mesh.vertexCapacityInput = 0;
+                    mesh.vertexCountOutput = 0;
+                    mesh.vertexPositions = nullptr;
+                    mesh.vertexNormals = nullptr;
+                    mesh.vertexUVs = nullptr;
+                    mesh.vertexBlendIndices = nullptr;
+                    mesh.vertexBlendWeights = nullptr;
+                    /// mesh - index
+                    mesh.indexCapacityInput = 0;
+                    mesh.indexCountOutput = 0;
+                    mesh.indices = nullptr;
+                    /// get mesh sizes
+                    OXR(xrGetHandMeshFB_(handTracker, &mesh));
+
+                    /// mesh storage - update sizes
+                    mesh.jointCapacityInput = mesh.jointCountOutput;
+                    mesh.vertexCapacityInput = mesh.vertexCountOutput;
+                    mesh.indexCapacityInput = mesh.indexCountOutput;
+                    /// skeleton
+                    std::vector<XrPosef> jointBindLocations;
+                    std::vector<XrHandJointEXT> parentData;
+                    std::vector<float> jointRadii;
+                    jointBindLocations.resize(mesh.jointCountOutput);
+                    parentData.resize(mesh.jointCountOutput);
+                    jointRadii.resize(mesh.jointCountOutput);
+                    mesh.jointBindPoses = jointBindLocations.data();
+                    mesh.jointParents = parentData.data();
+                    mesh.jointRadii = jointRadii.data();
+                    /// vertex
+                    std::vector<XrVector3f> vertexPositions;
+                    std::vector<XrVector3f> vertexNormals;
+                    std::vector<XrVector2f> vertexUVs;
+                    std::vector<XrVector4sFB> vertexBlendIndices;
+                    std::vector<XrVector4f> vertexBlendWeights;
+                    vertexPositions.resize(mesh.vertexCountOutput);
+                    vertexNormals.resize(mesh.vertexCountOutput);
+                    vertexUVs.resize(mesh.vertexCountOutput);
+                    vertexBlendIndices.resize(mesh.vertexCountOutput);
+                    vertexBlendWeights.resize(mesh.vertexCountOutput);
+                    mesh.vertexPositions = vertexPositions.data();
+                    mesh.vertexNormals = vertexNormals.data();
+                    mesh.vertexUVs = vertexUVs.data();
+                    mesh.vertexBlendIndices = vertexBlendIndices.data();
+                    mesh.vertexBlendWeights = vertexBlendWeights.data();
+                    /// index
+                    std::vector<int16_t> indices;
+                    indices.resize(mesh.indexCountOutput);
+                    mesh.indices = indices.data();
+
+                    /// call 2 - fill in the data
+                    /// chain capsules
+                    XrHandTrackingCapsulesStateFB capsuleState{
+                        XR_TYPE_HAND_TRACKING_CAPSULES_STATE_FB};
+                    capsuleState.next = nullptr;
+                    mesh.next = &capsuleState;
+
+                    /// get mesh data
+                    OXR(xrGetHandMeshFB_(handTracker, &mesh));
+                    /// init renderer
+                    handRenderer.Init(&mesh, true);
+                    /// Render jointRadius for all left hand joints
+                    {
+                        handJointRenderers.resize(XR_HAND_JOINT_COUNT_EXT);
+                        for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; ++i) {
+                            const OVR::Posef pose = FromXrPosef(jointLocations[i].pose);
+                            OVRFW::GeometryRenderer& gr = handJointRenderers[i];
+                            gr.Init(OVRFW::BuildTesselatedCapsuleDescriptor(
+                                mesh.jointRadii[i], 0.0f, 7, 7));
+                            gr.SetPose(pose);
+                            gr.DiffuseColor = jointColor_;
+                        }
+                    }
+                    /// One time init for capsules
+                    {
+                        handCapsuleRenderers.resize(XR_FB_HAND_TRACKING_CAPSULE_COUNT);
+                        for (int i = 0; i < XR_FB_HAND_TRACKING_CAPSULE_COUNT; ++i) {
+                            const OVR::Vector3f p0 =
+                                FromXrVector3f(capsuleState.capsules[i].points[0]);
+                            const OVR::Vector3f p1 =
+                                FromXrVector3f(capsuleState.capsules[i].points[1]);
+                            const OVR::Vector3f d = (p1 - p0);
+                            const float h = d.Length();
+                            const float r = capsuleState.capsules[i].radius;
+                            const OVR::Quatf look = OVR::Quatf::LookRotation(d, {0, 1, 0});
+                            OVRFW::GeometryRenderer& gr = handCapsuleRenderers[i];
+                            gr.Init(OVRFW::BuildTesselatedCapsuleDescriptor(r, h, 7, 7));
+                            gr.SetPose(OVR::Posef(look, p0));
+                            gr.DiffuseColor = capsuleColor_;
+                        }
+                    }
+                    /// Print hierarchy
+                    {
+                        for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; ++i) {
+                            const OVR::Posef pose = FromXrPosef(jointLocations[i].pose);
+                            ALOG(
+                                " { {%.6f, %.6f, %.6f},  {%.6f, %.6f, %.6f, %.6f} } // joint = %d, parent = %d",
+                                pose.Translation.x,
+                                pose.Translation.y,
+                                pose.Translation.z,
+                                pose.Rotation.x,
+                                pose.Rotation.y,
+                                pose.Rotation.z,
+                                pose.Rotation.w,
+                                i,
+                                (int)parentData[i]);
+                        }
+                    }
+                }
+            }
+        }
+
+
+        // ----------------------------
+        // Passthrough init
+        // ----------------------------
+        if (xrCreatePassthroughFB_ &&
+            xrCreatePassthroughLayerFB_ &&
+            xrPassthroughStartFB_ &&
+            xrPassthroughLayerResumeFB_) {
+
+            // 1) Create passthrough object
+            XrPassthroughCreateInfoFB ptInfo{XR_TYPE_PASSTHROUGH_CREATE_INFO_FB};
+            ptInfo.flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB;
+
+            XrResult ptRes = xrCreatePassthroughFB_(GetSession(), &ptInfo, &passthrough_);
+            if (XR_SUCCEEDED(ptRes)) {
+                ALOG("Passthrough created");
+            } else {
+                ALOG("Passthrough create failed: %d", ptRes);
+            }
+
+            // 2) Create passthrough layer
+            if (XR_SUCCEEDED(ptRes)) {
+                XrPassthroughLayerCreateInfoFB layerInfo{XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB};
+                layerInfo.passthrough = passthrough_;
+                layerInfo.flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB;
+                layerInfo.purpose = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB;
+
+                XrResult layerRes = xrCreatePassthroughLayerFB_(GetSession(), &layerInfo, &passthroughLayer_);
+                if (XR_SUCCEEDED(layerRes)) {
+                    ALOG("Passthrough layer created");
+                } else {
+                    ALOG("Passthrough layer create failed: %d", layerRes);
+                }
+
+                // 3) Start + Resume
+                if (XR_SUCCEEDED(layerRes)) {
+                    OXR(xrPassthroughStartFB_(passthrough_));
+                    OXR(xrPassthroughLayerResumeFB_(passthroughLayer_));
+
+                    passthroughCompLayer_.next = nullptr;
+                    // flags 는 0이면 안 됩니다. 유효한 composition layer flag 가 필요합니다. [3](https://guidebook.hdyar.com/xr-dev/virtual-reality/how-to-set-up-hand-tracking-in-quest/)
+                    passthroughCompLayer_.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    passthroughCompLayer_.space = XR_NULL_HANDLE;
+                    passthroughCompLayer_.layerHandle = passthroughLayer_;
+
+                    passthroughReady_ = true;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    virtual void PreProjectionAddLayer(
+            xrCompositorLayerUnion* layers,
+            int& layerCount) override {
+
+        if (!passthroughReady_) {
+            return;
+        }
+
+        if (layerCount >= MAX_NUM_LAYERS) {
+            ALOG("No room for passthrough layer");
+            return;
+        }
+
+        layers[layerCount++].Passthrough = passthroughCompLayer_;
+    }
+
+    virtual void PreEndFrame(XrFrameEndInfo& endFrameInfo) override {
+        if (passthroughReady_) {
+            endFrameInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+        }
+    }
+
+    virtual void SessionEnd() override {
+        /// Hand Tracker
+        if (xrDestroyHandTrackerEXT_) {
+            OXR(xrDestroyHandTrackerEXT_(handTrackerL_));
+            OXR(xrDestroyHandTrackerEXT_(handTrackerR_));
+        }
+        controllerRenderL_.Shutdown();
+        controllerRenderR_.Shutdown();
+        beamRenderer_.Shutdown();
+        axisRendererL_.Shutdown();
+        axisRendererR_.Shutdown();
+        handRendererL_.Shutdown();
+        handRendererR_.Shutdown();
+
+        // ----------------------------
+        // Passthrough shutdown
+        // ----------------------------
+        if (passthroughReady_) {
+            if (xrPassthroughLayerPauseFB_ && passthroughLayer_ != XR_NULL_HANDLE) {
+                xrPassthroughLayerPauseFB_(passthroughLayer_);
+            }
+            if (xrPassthroughPauseFB_ && passthrough_ != XR_NULL_HANDLE) {
+                xrPassthroughPauseFB_(passthrough_);
+            }
+            passthroughReady_ = false;
+        }
+
+        if (xrDestroyPassthroughLayerFB_ && passthroughLayer_ != XR_NULL_HANDLE) {
+            xrDestroyPassthroughLayerFB_(passthroughLayer_);
+            passthroughLayer_ = XR_NULL_HANDLE;
+        }
+
+        if (xrDestroyPassthroughFB_ && passthrough_ != XR_NULL_HANDLE) {
+            xrDestroyPassthroughFB_(passthrough_);
+            passthrough_ = XR_NULL_HANDLE;
+        }
+    }
+
+
+    // Update state
+    virtual void Update(const OVRFW::ovrApplFrameIn& in) override {
+        ui_.HitTestDevices().clear();
+
+        int pinchL = 0;
+        int pinchR = 0;
+
+
+        if ((in.AllButtons & OVRFW::ovrApplFrameIn::kButtonY) != 0) {
+            ALOG("Y button is pressed!");
+        }
+        if ((in.AllButtons & OVRFW::ovrApplFrameIn::kButtonMenu) != 0) {
+            ALOG("Menu button is pressed!");
+        }
+        if ((in.AllButtons & OVRFW::ovrApplFrameIn::kButtonA) != 0) {
+            ALOG("A button is pressed!");
+        }
+        if ((in.AllButtons & OVRFW::ovrApplFrameIn::kButtonB) != 0) {
+            ALOG("B button is pressed!");
+        }
+        if ((in.AllButtons & OVRFW::ovrApplFrameIn::kButtonX) != 0) {
+            ALOG("X button is pressed!");
+        }
+
+        /// Hands
+        if (xrLocateHandJointsEXT_) {
+            /// L
+            XrHandTrackingScaleFB scaleL{XR_TYPE_HAND_TRACKING_SCALE_FB};
+            scaleL.next = nullptr;
+            scaleL.sensorOutput = 1.0f;
+            scaleL.currentOutput = 1.0f;
+            scaleL.overrideValueInput = 1.00f;
+            scaleL.overrideHandScale = XR_FALSE; // XR_TRUE;
+            XrHandTrackingCapsulesStateFB capsuleStateL{XR_TYPE_HAND_TRACKING_CAPSULES_STATE_FB};
+            capsuleStateL.next = &scaleL;
+            XrHandTrackingAimStateFB aimStateL{XR_TYPE_HAND_TRACKING_AIM_STATE_FB};
+            aimStateL.next = &capsuleStateL;
+            XrHandJointVelocitiesEXT velocitiesL{XR_TYPE_HAND_JOINT_VELOCITIES_EXT};
+            velocitiesL.next = &aimStateL;
+            velocitiesL.jointCount = XR_HAND_JOINT_COUNT_EXT;
+            velocitiesL.jointVelocities = jointVelocitiesL_;
+            XrHandJointLocationsEXT locationsL{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+            locationsL.next = &velocitiesL;
+            locationsL.jointCount = XR_HAND_JOINT_COUNT_EXT;
+            locationsL.jointLocations = jointLocationsL_;
+            /// R
+            XrHandTrackingScaleFB scaleR{XR_TYPE_HAND_TRACKING_SCALE_FB};
+            scaleR.next = nullptr;
+            scaleR.sensorOutput = 1.0f;
+            scaleR.currentOutput = 1.0f;
+            scaleR.overrideValueInput = 1.00f;
+            scaleR.overrideHandScale = XR_FALSE; // XR_TRUE;
+            XrHandTrackingCapsulesStateFB capsuleStateR{XR_TYPE_HAND_TRACKING_CAPSULES_STATE_FB};
+            capsuleStateR.next = &scaleR;
+            XrHandTrackingAimStateFB aimStateR{XR_TYPE_HAND_TRACKING_AIM_STATE_FB};
+            aimStateR.next = &capsuleStateR;
+            XrHandJointVelocitiesEXT velocitiesR{XR_TYPE_HAND_JOINT_VELOCITIES_EXT};
+            velocitiesR.next = &aimStateR;
+            velocitiesR.jointCount = XR_HAND_JOINT_COUNT_EXT;
+            velocitiesR.jointVelocities = jointVelocitiesR_;
+            XrHandJointLocationsEXT locationsR{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+            locationsR.next = &velocitiesR;
+            locationsR.jointCount = XR_HAND_JOINT_COUNT_EXT;
+            locationsR.jointLocations = jointLocationsR_;
+
+            XrHandJointsLocateInfoEXT locateInfoL{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+            locateInfoL.baseSpace = GetLocalSpace();
+            locateInfoL.time = ToXrTime(in.PredictedDisplayTime);
+            OXR(xrLocateHandJointsEXT_(handTrackerL_, &locateInfoL, &locationsL));
+
+            XrHandJointsLocateInfoEXT locateInfoR{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+            locateInfoR.baseSpace = GetLocalSpace();
+            locateInfoR.time = ToXrTime(in.PredictedDisplayTime);
+            OXR(xrLocateHandJointsEXT_(handTrackerR_, &locateInfoR, &locationsR));
+
+            std::vector<OVR::Posef> handJointsL;
+            std::vector<OVR::Posef> handJointsR;
+
+            // Determine which joints are actually tracked
+            // XrSpaceLocationFlags isTracked = XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT
+            //    | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+
+            // Tracked joints and computed joints can all be valid
+            XrSpaceLocationFlags isValid =
+                XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+
+            handTrackedL_ = false;
+            handTrackedR_ = false;
+
+            if (locationsL.isActive) {
+                for (int i = 0; i < XR_FB_HAND_TRACKING_CAPSULE_COUNT; ++i) {
+                    const OVR::Vector3f p0 = FromXrVector3f(capsuleStateL.capsules[i].points[0]);
+                    const OVR::Vector3f p1 = FromXrVector3f(capsuleStateL.capsules[i].points[1]);
+                    const OVR::Vector3f d = (p1 - p0);
+                    const OVR::Quatf look = OVR::Quatf::LookRotation(d, {0, 1, 0});
+                    /// apply inverse scale here
+                    const float h = d.Length() / scaleL.currentOutput;
+                    const OVR::Vector3f start = p0 + look.Rotate(OVR::Vector3f(0, 0, -h / 2));
+                    OVRFW::GeometryRenderer& gr = handCapsuleRenderersL_[i];
+                    gr.SetScale(OVR::Vector3f(scaleL.currentOutput));
+                    gr.SetPose(OVR::Posef(look, start));
+                    gr.Update();
+                }
+                for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; ++i) {
+                    if ((jointLocationsL_[i].locationFlags & isValid) != 0) {
+                        const auto p = FromXrPosef(jointLocationsL_[i].pose);
+                        handJointsL.push_back(p);
+                        handTrackedL_ = true;
+                        OVRFW::GeometryRenderer& gr = handJointRenderersL_[i];
+                        gr.SetScale(OVR::Vector3f(scaleL.currentOutput));
+                        gr.SetPose(p);
+                        gr.Update();
+                    }
+                }
+                handRendererL_.Update(&jointLocationsL_[0]);
+                const bool didPinch =
+                        (aimStateL.status & XR_HAND_TRACKING_AIM_INDEX_PINCHING_BIT_FB) != 0;
+                pinchL = didPinch ? 1 : 0;
+
+                ui_.AddHitTestRay(FromXrPosef(aimStateL.aimPose), didPinch && !lastFrameClickedL_);
+                lastFrameClickedL_ = didPinch;
+
+            }
+            if (locationsR.isActive) {
+                for (int i = 0; i < XR_FB_HAND_TRACKING_CAPSULE_COUNT; ++i) {
+                    const OVR::Vector3f p0 = FromXrVector3f(capsuleStateR.capsules[i].points[0]);
+                    const OVR::Vector3f p1 = FromXrVector3f(capsuleStateR.capsules[i].points[1]);
+                    const OVR::Vector3f d = (p1 - p0);
+                    const OVR::Quatf look = OVR::Quatf::LookRotation(d, {0, 1, 0});
+                    /// apply inverse scale here
+                    const float h = d.Length() / scaleR.currentOutput;
+                    const OVR::Vector3f start = p0 + look.Rotate(OVR::Vector3f(0, 0, -h / 2));
+                    OVRFW::GeometryRenderer& gr = handCapsuleRenderersR_[i];
+                    gr.SetScale(OVR::Vector3f(scaleR.currentOutput));
+                    gr.SetPose(OVR::Posef(look, start));
+                    gr.Update();
+                }
+                for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; ++i) {
+                    if ((jointLocationsR_[i].locationFlags & isValid) != 0) {
+                        const auto p = FromXrPosef(jointLocationsR_[i].pose);
+                        handJointsR.push_back(p);
+                        handTrackedR_ = true;
+                        OVRFW::GeometryRenderer& gr = handJointRenderersR_[i];
+                        gr.SetScale(OVR::Vector3f(scaleR.currentOutput));
+                        gr.SetPose(p);
+                        gr.Update();
+                    }
+                }
+                handRendererR_.Update(&jointLocationsR_[0]);
+                const bool didPinch =
+                        (aimStateR.status & XR_HAND_TRACKING_AIM_INDEX_PINCHING_BIT_FB) != 0;
+                pinchR = didPinch ? 1 : 0;
+
+                ui_.AddHitTestRay(FromXrPosef(aimStateR.aimPose), didPinch && !lastFrameClickedR_);
+                lastFrameClickedR_ = didPinch;
+
+
+            }
+
+            SendHandTelemetry(in, aimStateL, aimStateR);
+
+            axisRendererL_.Update(handJointsL);
+            axisRendererR_.Update(handJointsR);
+        }
+
+        if (in.LeftRemoteTracked && !handTrackedL_) {
+            controllerRenderL_.Update(in.LeftRemotePose);
+            const bool didPinch = in.LeftRemoteIndexTrigger > 0.5f;
+            ui_.AddHitTestRay(in.LeftRemotePointPose, didPinch);
+        }
+        if (in.RightRemoteTracked && !handTrackedR_) {
+            controllerRenderR_.Update(in.RightRemotePose);
+            const bool didPinch = in.RightRemoteIndexTrigger > 0.5f;
+            ui_.AddHitTestRay(in.RightRemotePointPose, didPinch);
+        }
+
+
+        if (pinchStatusLabel_ != nullptr) {
+            char text[128];
+            std::snprintf(
+                    text,
+                    sizeof(text),
+                    "L tracked:%d pinch:%d | R tracked:%d pinch:%d",
+                    handTrackedL_ ? 1 : 0,
+                    pinchL,
+                    handTrackedR_ ? 1 : 0,
+                    pinchR);
+
+            pinchStatusLabel_->SetText(text);
+        }
+
+
+        ui_.Update(in);
+        beamRenderer_.Update(in, ui_.HitTestDevices());
+    }
+
+    // Render eye buffers while running
+    virtual void Render(const OVRFW::ovrApplFrameIn& in, OVRFW::ovrRendererOutput& out) override {
+        /// Render UI
+        ui_.Render(in, out);
+
+        /// Render controllers when hands are not tracked
+        if (in.LeftRemoteTracked && !handTrackedL_) {
+            controllerRenderL_.Render(out.Surfaces);
+        }
+        if (in.RightRemoteTracked && !handTrackedR_) {
+            controllerRenderR_.Render(out.Surfaces);
+        }
+
+        /// Render hand axes
+        if (handTrackedL_) {
+            axisRendererL_.Render(OVR::Matrix4f(), in, out);
+
+            if (renderJointsL_) {
+                for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; ++i) {
+                    OVRFW::GeometryRenderer& gr = handJointRenderersL_[i];
+                    gr.Render(out.Surfaces);
+                }
+            }
+
+            if (renderCapsulesL_) {
+                for (int i = 0; i < XR_FB_HAND_TRACKING_CAPSULE_COUNT; ++i) {
+                    OVRFW::GeometryRenderer& gr = handCapsuleRenderersL_[i];
+                    gr.Render(out.Surfaces);
+                }
+            }
+
+            if (renderMeshL_) {
+                handRendererL_.Render(out.Surfaces);
+            }
+        }
+        if (handTrackedR_) {
+            axisRendererR_.Render(OVR::Matrix4f(), in, out);
+
+            if (renderJointsR_) {
+                for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; ++i) {
+                    OVRFW::GeometryRenderer& gr = handJointRenderersR_[i];
+                    gr.Render(out.Surfaces);
+                }
+            }
+
+            if (renderCapsulesR_) {
+                for (int i = 0; i < XR_FB_HAND_TRACKING_CAPSULE_COUNT; ++i) {
+                    OVRFW::GeometryRenderer& gr = handCapsuleRenderersR_[i];
+                    gr.Render(out.Surfaces);
+                }
+            }
+
+            if (renderMeshR_) {
+                handRendererR_.Render(out.Surfaces);
+            }
+        }
+
+        /// Render beams
+        beamRenderer_.Render(in, out);
+    }
+
+   public:
+    /// Hands - extension functions
+    PFN_xrCreateHandTrackerEXT xrCreateHandTrackerEXT_ = nullptr;
+    PFN_xrDestroyHandTrackerEXT xrDestroyHandTrackerEXT_ = nullptr;
+    PFN_xrLocateHandJointsEXT xrLocateHandJointsEXT_ = nullptr;
+    /// Hands - FB mesh rendering extensions
+    PFN_xrGetHandMeshFB xrGetHandMeshFB_ = nullptr;
+    /// Hands - tracker handles
+    XrHandTrackerEXT handTrackerL_ = XR_NULL_HANDLE;
+    XrHandTrackerEXT handTrackerR_ = XR_NULL_HANDLE;
+    /// Hands - data buffers
+    XrHandJointLocationEXT jointLocationsL_[XR_HAND_JOINT_COUNT_EXT];
+    XrHandJointLocationEXT jointLocationsR_[XR_HAND_JOINT_COUNT_EXT];
+    XrHandJointVelocityEXT jointVelocitiesL_[XR_HAND_JOINT_COUNT_EXT];
+    XrHandJointVelocityEXT jointVelocitiesR_[XR_HAND_JOINT_COUNT_EXT];
+
+
+
+private:
+    TcpSender tcpSender_;
+    bool tcpReady_ = false;
+
+    // USB + adb reverse 기준으로 Quest 입장에서는 localhost 사용
+    std::string tcpIp_ = "127.0.0.1";
+    int tcpPort_ = 7000;
+
+
+
+private:
+    OVRFW::ControllerRenderer controllerRenderL_;
+    OVRFW::ControllerRenderer controllerRenderR_;
+    OVRFW::HandRenderer handRendererL_;
+    OVRFW::HandRenderer handRendererR_;
+    OVRFW::TinyUI ui_;
+    OVRFW::SimpleBeamRenderer beamRenderer_;
+    std::vector<OVRFW::ovrBeamRenderer::handle_t> beams_;
+    OVRFW::ovrAxisRenderer axisRendererL_;
+    OVRFW::ovrAxisRenderer axisRendererR_;
+    bool handTrackedL_ = false;
+    bool handTrackedR_ = false;
+
+    bool lastFrameClickedL_ = false;
+    bool lastFrameClickedR_ = false;
+
+    OVR::Vector4f jointColor_{0.4, 0.5, 0.2, 0.5};
+    OVR::Vector4f capsuleColor_{0.4, 0.2, 0.2, 0.5};
+
+    bool renderMeshL_ = true;
+    bool renderMeshR_ = true;
+    bool renderJointsL_ = false;
+    bool renderJointsR_ = false;
+    bool renderCapsulesL_ = false;
+    bool renderCapsulesR_ = false;
+
+    OVRFW::VRMenuObject* renderMeshLButton_ = nullptr;
+    OVRFW::VRMenuObject* renderMeshRButton_ = nullptr;
+    OVRFW::VRMenuObject* renderJointsLButton_ = nullptr;
+    OVRFW::VRMenuObject* renderJointsRButton_ = nullptr;
+    OVRFW::VRMenuObject* renderCapsulesLButton_ = nullptr;
+    OVRFW::VRMenuObject* renderCapsulesRButton_ = nullptr;
+    OVRFW::VRMenuObject* pinchStatusLabel_ = nullptr;
+
+    // --- Passthrough function pointers ---
+    PFN_xrCreatePassthroughFB xrCreatePassthroughFB_ = nullptr;
+    PFN_xrDestroyPassthroughFB xrDestroyPassthroughFB_ = nullptr;
+    PFN_xrPassthroughStartFB xrPassthroughStartFB_ = nullptr;
+    PFN_xrPassthroughPauseFB xrPassthroughPauseFB_ = nullptr;
+
+    PFN_xrCreatePassthroughLayerFB xrCreatePassthroughLayerFB_ = nullptr;
+    PFN_xrDestroyPassthroughLayerFB xrDestroyPassthroughLayerFB_ = nullptr;
+    PFN_xrPassthroughLayerResumeFB xrPassthroughLayerResumeFB_ = nullptr;
+    PFN_xrPassthroughLayerPauseFB xrPassthroughLayerPauseFB_ = nullptr;
+
+    // --- Passthrough handles ---
+    XrPassthroughFB passthrough_ = XR_NULL_HANDLE;
+    XrPassthroughLayerFB passthroughLayer_ = XR_NULL_HANDLE;
+
+    // --- Passthrough composition layer ---
+    XrCompositionLayerPassthroughFB passthroughCompLayer_{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
+
+    bool passthroughReady_ = false;
+
+
+    std::vector<OVRFW::GeometryRenderer> handJointRenderersL_;
+    std::vector<OVRFW::GeometryRenderer> handJointRenderersR_;
+    std::vector<OVRFW::GeometryRenderer> handCapsuleRenderersL_;
+    std::vector<OVRFW::GeometryRenderer> handCapsuleRenderersR_;
+};
+
+ENTRY_POINT(XrHandsApp)
