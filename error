@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\Meta_Quest_teleop\MetaQ_TesolloR_teleop.py", line 614, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\Administrator\PycharmProjects\Meta_Quest_teleop\MetaQ_TesolloR_teleop.py", line 566, in main
+    desired[m] = clamp_step_to_current(m, desired[m], cur_pos.get(m, 0))
+                 ^^^^^^^^^^^^^^^^^^^^^
+NameError: name 'clamp_step_to_current' is not defined
